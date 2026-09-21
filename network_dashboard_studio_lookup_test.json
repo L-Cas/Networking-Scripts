@@ -1,0 +1,137 @@
+{
+  "title": "Network Dashboard - Lookup Scope Test",
+  "description": "Dashboard Studio test definition for CSV-driven NOC -> Location -> scope cascading inputs.",
+  "inputs": {
+    "input_global_time": {
+      "type": "input.timerange",
+      "title": "Time Range",
+      "options": {
+        "token": "global_time",
+        "defaultValue": "-24h@h,now"
+      }
+    },
+    "input_noc": {
+      "type": "input.dropdown",
+      "title": "NOC / Main Location",
+      "dataSources": {
+        "primary": "ds_noc_lookup"
+      },
+      "context": {
+        "formattedConfig": {
+          "number": {
+            "prefix": ""
+          }
+        },
+        "label": ">primary | seriesByName(\"noc_label\") | renameSeries(\"label\") | formatByType(formattedConfig)",
+        "value": ">primary | seriesByName(\"noc_id\") | renameSeries(\"value\") | formatByType(formattedConfig)"
+      },
+      "options": {
+        "items": ">frame(label, value) | objects()",
+        "token": "noc",
+        "hideWhenNoData": false
+      }
+    },
+    "input_location": {
+      "type": "input.dropdown",
+      "title": "Managed Site / Location",
+      "dataSources": {
+        "primary": "ds_location_lookup"
+      },
+      "context": {
+        "formattedConfig": {
+          "number": {
+            "prefix": ""
+          }
+        },
+        "label": ">primary | seriesByName(\"scope_label\") | renameSeries(\"label\") | formatByType(formattedConfig)",
+        "value": ">primary | seriesByName(\"scope_value\") | renameSeries(\"value\") | formatByType(formattedConfig)"
+      },
+      "options": {
+        "items": ">frame(label, value) | objects()",
+        "token": "scope",
+        "hideWhenNoData": false
+      }
+    }
+  },
+  "dataSources": {
+    "ds_noc_lookup": {
+      "type": "ds.search",
+      "name": "NOC choices from lookup",
+      "options": {
+        "query": "| inputlookup network_dashboard_scope.csv\n| search record_type=\"LOCATION\" status=\"OK\"\n| stats first(noc_label) as noc_label by noc_id\n| sort 0 noc_label\n| table noc_label noc_id"
+      }
+    },
+    "ds_location_lookup": {
+      "type": "ds.search",
+      "name": "Managed location choices for selected NOC",
+      "options": {
+        "query": "| inputlookup network_dashboard_scope.csv\n| search record_type=\"LOCATION\" status=\"OK\" noc_id=\"$noc$\"\n| sort 0 scope_sort scope_label\n| table scope_label scope_value location_id"
+      }
+    },
+    "ds_scope_test": {
+      "type": "ds.search",
+      "name": "Scope test",
+      "options": {
+        "query": "index=\"network_eo\" sourcetype=\"cisco:ios\"\n$scope$\n| head 100\n| table _time host source sourcetype _raw\n| sort - _time",
+        "queryParameters": {
+          "earliest": "$global_time.earliest$",
+          "latest": "$global_time.latest$"
+        }
+      }
+    }
+  },
+  "defaults": {
+    "dataSources": {
+      "ds.search": {
+        "options": {
+          "queryParameters": {
+            "earliest": "$global_time.earliest$",
+            "latest": "$global_time.latest$"
+          }
+        }
+      }
+    }
+  },
+  "visualizations": {
+    "viz_scope_test": {
+      "type": "splunk.table",
+      "title": "Selected Location Scope Test",
+      "description": "Confirms that $scope$ expands to the selected Location's scope_value.",
+      "dataSources": {
+        "primary": "ds_scope_test"
+      }
+    }
+  },
+  "layout": {
+    "globalInputs": [
+      "input_global_time",
+      "input_noc",
+      "input_location"
+    ],
+    "layoutDefinitions": {
+      "layout_1": {
+        "type": "grid",
+        "structure": [
+          {
+            "item": "viz_scope_test",
+            "type": "block",
+            "position": {
+              "x": 0,
+              "y": 0,
+              "w": 1200,
+              "h": 420
+            }
+          }
+        ]
+      }
+    },
+    "tabs": {
+      "items": [
+        {
+          "label": "Scope Test",
+          "layoutId": "layout_1"
+        }
+      ]
+    }
+  }
+}
