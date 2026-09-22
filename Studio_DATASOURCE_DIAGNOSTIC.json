@@ -1,0 +1,77 @@
+{
+  "title": "Dashboard Studio Data Source Diagnostic",
+  "description": "No dropdowns. Tests whether Dashboard Studio can execute a literal ds.search and the NOC_Site_Lookup.csv ds.search.",
+  "inputs": {},
+  "visualizations": {
+    "viz_literal": {
+      "type": "splunk.table",
+      "title": "TEST 1 - Literal ds.search",
+      "description": "If this loads, ds.search itself is working.",
+      "dataSources": {
+        "primary": "ds_literal"
+      }
+    },
+    "viz_lookup": {
+      "type": "splunk.table",
+      "title": "TEST 2 - NOC_Site_Lookup.csv",
+      "description": "If Test 1 works but this fails, the problem is lookup access/name/app context.",
+      "dataSources": {
+        "primary": "ds_lookup"
+      }
+    }
+  },
+  "dataSources": {
+    "ds_literal": {
+      "type": "ds.search",
+      "name": "Literal datasource test",
+      "options": {
+        "query": "| makeresults | eval noc_label=\"Syracuse, NY\", noc_id=\"SYR\" | table noc_label noc_id"
+      }
+    },
+    "ds_lookup": {
+      "type": "ds.search",
+      "name": "Lookup datasource test",
+      "options": {
+        "query": "| inputlookup NOC_Site_Lookup.csv | table noc_id noc_label location_id scope_label scope_value scope_sort record_type status"
+      }
+    }
+  },
+  "layout": {
+    "globalInputs": [],
+    "layoutDefinitions": {
+      "layout_1": {
+        "type": "grid",
+        "structure": [
+          {
+            "item": "viz_literal",
+            "type": "block",
+            "position": {
+              "x": 0,
+              "y": 0,
+              "w": 1200,
+              "h": 300
+            }
+          },
+          {
+            "item": "viz_lookup",
+            "type": "block",
+            "position": {
+              "x": 0,
+              "y": 300,
+              "w": 1200,
+              "h": 420
+            }
+          }
+        ]
+      }
+    },
+    "tabs": {
+      "items": [
+        {
+          "label": "Datasource Test",
+          "layoutId": "layout_1"
+        }
+      ]
+    }
+  }
+}
