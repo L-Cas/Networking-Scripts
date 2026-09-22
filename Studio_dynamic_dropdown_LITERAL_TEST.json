@@ -1,0 +1,68 @@
+{
+  "title": "Dynamic Dropdown Engine Test",
+  "description": "Does not access a lookup. If this dropdown loads, Dashboard Studio dynamic inputs are working.",
+  "inputs": {
+    "input_noc": {
+      "context": {
+        "formattedConfig": {
+          "number": {
+            "prefix": ""
+          }
+        },
+        "formattedStatics": ">statics | formatByType(formattedConfig)",
+        "label": ">primary | seriesByName(\"noc_label\") | renameSeries(\"label\") | formatByType(formattedConfig)",
+        "statics": [
+          [
+            "Test Static"
+          ],
+          [
+            "TEST"
+          ]
+        ],
+        "value": ">primary | seriesByName(\"noc_id\") | renameSeries(\"value\") | formatByType(formattedConfig)"
+      },
+      "dataSources": {
+        "primary": "ds_noc_lookup"
+      },
+      "options": {
+        "items": ">frame(label, value) | prepend(formattedStatics) | objects()",
+        "token": "noc"
+      },
+      "title": "NOC / Main Location",
+      "type": "input.dropdown"
+    }
+  },
+  "dataSources": {
+    "ds_noc_lookup": {
+      "type": "ds.search",
+      "name": "Literal NOC test",
+      "options": {
+        "query": "| makeresults | eval noc_label=\"Syracuse, NY\", noc_id=\"SYR\" | table noc_label noc_id",
+        "queryParameters": {
+          "earliest": "-24h@h",
+          "latest": "now"
+        }
+      }
+    }
+  },
+  "visualizations": {},
+  "layout": {
+    "globalInputs": [
+      "input_noc"
+    ],
+    "layoutDefinitions": {
+      "layout_1": {
+        "type": "grid",
+        "structure": []
+      }
+    },
+    "tabs": {
+      "items": [
+        {
+          "label": "Test",
+          "layoutId": "layout_1"
+        }
+      ]
+    }
+  }
+}
