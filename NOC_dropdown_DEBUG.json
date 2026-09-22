@@ -1,0 +1,83 @@
+{
+  "title": "NOC Lookup Dropdown Debug",
+  "description": "Minimal Dashboard Studio test for NOC_Site_Lookup.csv.",
+  "inputs": {
+    "input_noc": {
+      "type": "input.dropdown",
+      "title": "NOC / Main Location",
+      "dataSources": {
+        "primary": "ds_noc_lookup"
+      },
+      "context": {
+        "formattedConfig": {
+          "number": {
+            "prefix": ""
+          }
+        },
+        "formattedStatics": ">statics | formatByType(formattedConfig)",
+        "statics": [],
+        "label": ">primary | seriesByName(\"noc_label\") | renameSeries(\"label\") | formatByType(formattedConfig)",
+        "value": ">primary | seriesByName(\"noc_id\") | renameSeries(\"value\") | formatByType(formattedConfig)"
+      },
+      "options": {
+        "items": ">frame(label, value) | prepend(formattedStatics) | objects()",
+        "token": "noc"
+      }
+    }
+  },
+  "dataSources": {
+    "ds_noc_lookup": {
+      "type": "ds.search",
+      "name": "NOC lookup test",
+      "options": {
+        "query": "| inputlookup NOC_Site_Lookup.csv\n| search record_type=\"LOCATION\" status=\"OK\"\n| dedup noc_id\n| sort 0 noc_label\n| table noc_label noc_id"
+      }
+    },
+    "ds_raw_lookup": {
+      "type": "ds.search",
+      "name": "Raw lookup rows",
+      "options": {
+        "query": "| inputlookup NOC_Site_Lookup.csv\n| table noc_id noc_label location_id scope_label scope_value scope_sort record_type status"
+      }
+    }
+  },
+  "visualizations": {
+    "viz_lookup_rows": {
+      "type": "splunk.table",
+      "title": "Raw lookup rows visible to this dashboard",
+      "dataSources": {
+        "primary": "ds_raw_lookup"
+      }
+    }
+  },
+  "layout": {
+    "globalInputs": [
+      "input_noc"
+    ],
+    "layoutDefinitions": {
+      "layout_1": {
+        "type": "grid",
+        "structure": [
+          {
+            "item": "viz_lookup_rows",
+            "type": "block",
+            "position": {
+              "x": 0,
+              "y": 0,
+              "w": 1200,
+              "h": 400
+            }
+          }
+        ]
+      }
+    },
+    "tabs": {
+      "items": [
+        {
+          "label": "Lookup Debug",
+          "layoutId": "layout_1"
+        }
+      ]
+    }
+  }
+}

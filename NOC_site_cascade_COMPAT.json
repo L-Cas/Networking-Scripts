@@ -1,0 +1,123 @@
+{
+  "title": "NOC Site Lookup Cascade",
+  "description": "Compatibility-first Dashboard Studio NOC -> Site cascade using NOC_Site_Lookup.csv.",
+  "inputs": {
+    "input_noc": {
+      "type": "input.dropdown",
+      "title": "NOC / Main Location",
+      "dataSources": {
+        "primary": "ds_noc_lookup"
+      },
+      "context": {
+        "formattedConfig": {
+          "number": {
+            "prefix": ""
+          }
+        },
+        "formattedStatics": ">statics | formatByType(formattedConfig)",
+        "statics": [],
+        "label": ">primary | seriesByName(\"noc_label\") | renameSeries(\"label\") | formatByType(formattedConfig)",
+        "value": ">primary | seriesByName(\"noc_id\") | renameSeries(\"value\") | formatByType(formattedConfig)"
+      },
+      "options": {
+        "items": ">frame(label, value) | prepend(formattedStatics) | objects()",
+        "token": "noc"
+      }
+    },
+    "input_location": {
+      "type": "input.dropdown",
+      "title": "Managed Site / Location",
+      "dataSources": {
+        "primary": "ds_location_lookup"
+      },
+      "context": {
+        "formattedConfig": {
+          "number": {
+            "prefix": ""
+          }
+        },
+        "formattedStatics": ">statics | formatByType(formattedConfig)",
+        "statics": [],
+        "label": ">primary | seriesByName(\"scope_label\") | renameSeries(\"label\") | formatByType(formattedConfig)",
+        "value": ">primary | seriesByName(\"scope_value\") | renameSeries(\"value\") | formatByType(formattedConfig)"
+      },
+      "options": {
+        "items": ">frame(label, value) | prepend(formattedStatics) | objects()",
+        "token": "scope"
+      }
+    }
+  },
+  "dataSources": {
+    "ds_lookup_base": {
+      "type": "ds.search",
+      "name": "Valid NOC Site lookup rows",
+      "options": {
+        "query": "| inputlookup NOC_Site_Lookup.csv\n| search record_type=\"LOCATION\" status=\"OK\"\n| table noc_id noc_label location_id scope_label scope_value scope_sort"
+      }
+    },
+    "ds_noc_lookup": {
+      "type": "ds.chain",
+      "name": "NOC choices",
+      "options": {
+        "extend": "ds_lookup_base",
+        "query": "| stats first(noc_label) as noc_label by noc_id\n| sort 0 noc_label\n| table noc_label noc_id"
+      }
+    },
+    "ds_location_lookup": {
+      "type": "ds.chain",
+      "name": "Locations for selected NOC",
+      "options": {
+        "extend": "ds_lookup_base",
+        "query": "| search noc_id=\"$noc$\"\n| sort 0 scope_sort scope_label\n| table scope_label scope_value location_id"
+      }
+    },
+    "ds_selected_location_debug": {
+      "type": "ds.chain",
+      "name": "Selected NOC rows",
+      "options": {
+        "extend": "ds_lookup_base",
+        "query": "| search noc_id=\"$noc$\"\n| table noc_id noc_label location_id scope_label scope_value scope_sort"
+      }
+    }
+  },
+  "visualizations": {
+    "viz_selected_rows": {
+      "type": "splunk.table",
+      "title": "Rows for selected NOC",
+      "dataSources": {
+        "primary": "ds_selected_location_debug"
+      }
+    }
+  },
+  "layout": {
+    "globalInputs": [
+      "input_noc",
+      "input_location"
+    ],
+    "layoutDefinitions": {
+      "layout_1": {
+        "type": "grid",
+        "structure": [
+          {
+            "item": "viz_selected_rows",
+            "type": "block",
+            "position": {
+              "x": 0,
+              "y": 0,
+              "w": 1200,
+              "h": 400
+            }
+          }
+        ]
+      }
+    },
+    "tabs": {
+      "items": [
+        {
+          "label": "Cascade Test",
+          "layoutId": "layout_1"
+        }
+      ]
+    }
+  }
+}
