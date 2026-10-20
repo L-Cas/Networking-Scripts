@@ -1,0 +1,3272 @@
+#!/usr/bin/env python3
+"""
+Netmiko Universal Collector - Alpha v0.9.0
+
+Standalone, read-only SSH collector for network engineers.
+
+Alpha v0.8 visual storage-layout update:
+- Device library stays front-and-center.
+- Only Command Profile, Authentication, and Use Token remain as persistent run choices.
+- Manual credentials and token entry are temporary pop-up dialogs.
+- Ping and Test SSH are compact secondary actions; Run Collection is the primary action.
+- Disabled actions remain visible and greyed when no devices are selected.
+- Completed operations finish at 100% with green/red/amber result states.
+- Every collection uses one batch ID, profile-aware filenames, and a batch manifest/summary.
+- Per-device JSON follows frozen Universal Collection Schema 1.0.
+- Successful show running-config/show run output also creates a standalone recovery .cfg artifact.
+- Optional persistent setting automatically appends show running-config when a profile does not already collect it.
+- Command output is preserved exactly as returned by Netmiko (prompt/echo stripped only).
+- Command status, timestamps, connection status, profile hashes, and file references are standardized.
+- A local machine-readable schema contract is written for downstream parser authors.
+- Last profile/auth choices persist locally; token selection does not.
+- Device libraries can be shared as JSON or Excel.
+- Collection storage uses one visual folder hierarchy with movable save points for Manifest, Summary, and device capture files.
+- Directory layout is intentionally outside Schema 1.0; manifests remain the authoritative file index.
+
+Runtime dependencies:
+    pip install netmiko openpyxl
+
+openpyxl is only required for Excel import/export/template features.
+"""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import platform
+import queue
+import re
+import socket
+import subprocess
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+try:
+    from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeoutException
+except Exception:
+    ConnectHandler = None
+    NetmikoAuthenticationException = Exception
+    NetmikoTimeoutException = Exception
+
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.worksheet.table import Table, TableStyleInfo
+except Exception:
+    Workbook = None
+    load_workbook = None
+    Alignment = None
+    Font = None
+    PatternFill = None
+    Table = None
+    TableStyleInfo = None
+
+
+APP_NAME = "Netmiko Universal Collector"
+COLLECTOR_VERSION = "0.9.0-alpha"
+SCHEMA_VERSION = "1.0"
+SCHEMA_NAME = "netmiko_universal_collection"
+SCHEMA_STATUS = "frozen"
+
+APP_DIR = Path.home() / "Documents" / "NetmikoCollector"
+DEVICE_FILE = APP_DIR / "devices.json"
+CREDENTIAL_FILE = APP_DIR / "credentials.json"
+SETTINGS_FILE = APP_DIR / "settings.json"
+SCHEMA_SPEC_FILE = APP_DIR / "Universal_Collection_Schema_v1.0.json"
+PROFILE_DIR = APP_DIR / "CommandProfiles"
+OUTPUT_DIR = APP_DIR / "Collections"
+
+DEFAULT_PROFILE_NAME = "General Switch"
+DEFAULT_PROFILE_FILE = PROFILE_DIR / "General Switch.txt"
+
+DEVICE_EXCEL_HEADERS = [
+    "Name / Alias",
+    "IP Address",
+    "Location",
+    "Role",
+    "Device Type",
+    "Notes",
+]
+
+DEFAULT_COMMANDS = [
+    "# General Switch - intended to work on most Cisco IOS / IOS-XE devices",
+    "# Blank lines and lines beginning with # are ignored.",
+    "",
+    "show clock",
+    "show version",
+    "show inventory",
+    "show ip interface brief",
+    "show interfaces status",
+    "show interfaces description",
+    "show vlan brief",
+    "show cdp neighbors",
+    "show lldp neighbors",
+    "show etherchannel summary",
+    "show spanning-tree summary",
+    "show ip route",
+    "show logging",
+    "show running-config",
+]
+
+COMMAND_ERROR_PATTERNS = [
+    "% Invalid input",
+    "% Incomplete command",
+    "% Ambiguous command",
+    "Invalid input detected",
+    "Unknown command",
+]
+
+READ_ONLY_PREFIXES = (
+    "show ",
+    "sh ",  # Common Cisco SHOW shorthand; space prevents matching commands like shutdown.
+    "dir",
+    "ping ",
+    "traceroute ",
+    "traceroute6 ",
+)
+
+# Full running-config commands that are safe to promote into a standalone .cfg artifact.
+# Piped/filtered variants are intentionally excluded because they are not complete backups.
+RUNNING_CONFIG_COMMANDS = {
+    "show running-config",
+    "show running config",
+    "show run",
+    "sh running-config",
+    "sh running config",
+    "sh run",
+    "show running-config all",
+    "show run all",
+}
+
+
+# Visual collection-storage layout model. Users build ONE ordered folder hierarchy.
+# Saved artifact groups then choose a depth on that hierarchy rather than being forced
+# into separate collection/device trees.
+STORAGE_TOKEN_LABELS = {
+    "date": "Date",
+    "year": "Year",
+    "month": "Month",
+    "location": "Location",
+    "device": "Device Name",
+    "ip": "IP Address",
+    "role": "Role",
+    "profile": "Command Profile",
+    "collection_id": "Collection ID",
+}
+
+STORAGE_TOKENS = [
+    "date", "year", "month", "location", "device", "ip", "role", "profile", "collection_id"
+]
+DEVICE_SCOPED_STORAGE_TOKENS = {"location", "device", "ip", "role"}
+
+
+def token_part(name):
+    return {"type": "token", "value": name}
+
+
+def text_part(value):
+    return {"type": "text", "value": value}
+
+
+def level(*parts):
+    return {"parts": list(parts)}
+
+
+STORAGE_LAYOUT_PRESETS = {
+    "By Collection": {
+        "levels": [
+            level(token_part("date")),
+            level(token_part("profile"), text_part("_"), token_part("collection_id")),
+            level(token_part("location")),
+            level(token_part("device")),
+        ],
+        "destinations": {"manifest": 2, "summary": 2, "device_files": 4},
+    },
+    "Profile First": {
+        "levels": [
+            level(token_part("profile")),
+            level(token_part("date"), text_part("_"), token_part("collection_id")),
+            level(token_part("location")),
+            level(token_part("device")),
+        ],
+        "destinations": {"manifest": 2, "summary": 2, "device_files": 4},
+    },
+    "Monthly Archive": {
+        "levels": [
+            level(token_part("year")),
+            level(token_part("month")),
+            level(token_part("profile"), text_part("_"), token_part("collection_id")),
+            level(token_part("location")),
+            level(token_part("device")),
+        ],
+        "destinations": {"manifest": 3, "summary": 3, "device_files": 5},
+    },
+    "Simple": {
+        "levels": [
+            level(token_part("date")),
+            level(token_part("collection_id")),
+            level(token_part("device")),
+        ],
+        "destinations": {"manifest": 2, "summary": 2, "device_files": 3},
+    },
+    "Flat Collection": {
+        "levels": [
+            level(token_part("date")),
+            level(token_part("profile"), text_part("_"), token_part("collection_id")),
+        ],
+        "destinations": {"manifest": 2, "summary": 2, "device_files": 2},
+    },
+}
+
+# Historical v0.8 behavior, represented in the new one-hierarchy model.
+DEFAULT_STORAGE_LAYOUT = STORAGE_LAYOUT_PRESETS["By Collection"]
+
+def clone_layout(layout):
+    return json.loads(json.dumps(layout))
+
+
+OUTPUT_SCHEMA_SPEC = {
+    "schema_name": SCHEMA_NAME,
+    "schema_version": SCHEMA_VERSION,
+    "status": SCHEMA_STATUS,
+    "description": (
+        "Frozen output contract for Netmiko Universal Collector device collections and "
+        "batch manifests. Future additive fields may be introduced without removing or "
+        "renaming Schema 1.0 fields. Breaking changes require a new schema version."
+    ),
+    "device_collection": {
+        "document_type": "device_collection",
+        "required_top_level_keys": [
+            "schema_version", "schema_name", "document_type", "collector", "collection",
+            "device", "connection", "commands", "summary"
+        ],
+        "connection_status_values": [
+            "success", "tcp_22_unreachable", "authentication_failed", "timeout", "connection_error"
+        ],
+        "command_status_values": ["success", "cli_error", "timeout", "execution_error"],
+        "overall_status_values": ["success", "partial", "connection_failed"],
+        "raw_output_contract": (
+            "commands[].output contains the command response returned by Netmiko send_command "
+            "with strip_prompt=True and strip_command=True. The collector does not parse, sort, "
+            "normalize, or reinterpret command output."
+        ),
+        "optional_artifacts": {
+            "running_config": (
+                "When a recognized full running-config command succeeds, artifacts.running_config "
+                "describes a sibling .cfg recovery file. commands[].output remains the authoritative "
+                "unaltered command response."
+            )
+        },
+    },
+    "collection_manifest": {
+        "document_type": "collection_manifest",
+        "purpose": "Stable batch index containing run metadata, summary counts, and relative paths to device files.",
+        "path_contract": (
+            "Device file paths and collection artifact paths are relative to the directory containing the manifest. "
+            "The Manifest and Summary may be stored at different user-configured save points."
+        ),
+    },
+    "security_contract": [
+        "Passwords are never written to collector output.",
+        "Token/suffix values are never written to collector output.",
+        "Username, credential preset/source name, and whether a token was used may be recorded."
+    ],
+    "file_conventions": {
+        "device_log": "<device>_<profile>_<collection_id>.log",
+        "device_json": "<device>_<profile>_<collection_id>.json",
+        "running_config_cfg": "<device>_running-config_<collection_id>.cfg",
+        "batch_summary_log": "Collection_Summary_<profile>_<collection_id>.log",
+        "batch_manifest_json": "Collection_Manifest_<profile>_<collection_id>.json",
+        "collection_id_format": "YYYYMMDD_HHMMSS",
+        "downstream_entry_point": "Prefer the batch manifest JSON, then follow its relative device file paths.",
+        "directory_layout_contract": (
+            "Collection directory layout is user-configurable and is not part of the frozen schema. "
+            "Downstream tools must follow relative file paths recorded in the batch manifest rather than assume folders."
+        ),
+        "running_config_contract": (
+            "The .cfg is a derived recovery artifact created only from a successful full running-config response. "
+            "Cisco display-only preamble lines are removed; the configuration body is otherwise preserved."
+        )
+    },
+    "compatibility_policy": [
+        "Schema 1.0 field names and meanings are frozen.",
+        "Future collector versions may add optional fields but must not rename or remove Schema 1.0 fields.",
+        "Downstream scripts should ignore unknown fields.",
+        "Any breaking output change requires a new schema_version."
+    ],
+}
+
+
+# -----------------------------------------------------------------------------
+# Files / helpers
+# -----------------------------------------------------------------------------
+
+def atomic_write_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp.replace(path)
+
+
+def load_json(path: Path, default):
+    if not path.exists():
+        atomic_write_json(path, default)
+        return default
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def ensure_defaults():
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not DEFAULT_PROFILE_FILE.exists():
+        DEFAULT_PROFILE_FILE.write_text("\n".join(DEFAULT_COMMANDS) + "\n", encoding="utf-8")
+
+    meta = DEFAULT_PROFILE_FILE.with_suffix(".json")
+    if not meta.exists():
+        atomic_write_json(meta, {
+            "name": DEFAULT_PROFILE_NAME,
+            "description": "General-purpose Cisco IOS / IOS-XE read-only collection profile.",
+            "device_type": "cisco_ios",
+            "read_timeout": 45,
+        })
+
+    if not DEVICE_FILE.exists():
+        atomic_write_json(DEVICE_FILE, [])
+
+    if not CREDENTIAL_FILE.exists():
+        atomic_write_json(CREDENTIAL_FILE, {
+            "default_profile": "General",
+            "presets": {
+                "General": {
+                    "username": "",
+                    "password_base": "",
+                    "description": "Primary/default credential preset",
+                }
+            },
+        })
+
+    if not SETTINGS_FILE.exists():
+        atomic_write_json(SETTINGS_FILE, {
+            "default_device_type": "cisco_ios",
+            "output_directory": str(OUTPUT_DIR),
+            "read_only_protection": True,
+            "tcp_22_precheck": True,
+            "always_collect_running_config": True,
+            "command_timeout": 45,
+            "last_command_profile": DEFAULT_PROFILE_NAME,
+            "last_auth_preset": "General",
+            "last_collection_directory": "",
+            "storage_layout": clone_layout(DEFAULT_STORAGE_LAYOUT),
+            "storage_layout_name": "By Collection",
+            "storage_custom_presets": {},
+        })
+
+    # Schema 1.0 field names and meanings remain frozen. The spec file is refreshed on launch
+    # so additive, backwards-compatible documentation (such as optional artifacts) stays current.
+    atomic_write_json(SCHEMA_SPEC_FILE, OUTPUT_SCHEMA_SPEC)
+
+
+def safe_filename(value: str) -> str:
+    value = re.sub(r'[<>:"/\\|?*]+', "_", str(value or "").strip())
+    value = re.sub(r"\s+", "_", value)
+    return value or "device"
+
+
+def storage_token_values(now: datetime, profile: str, collection_id: str, device=None):
+    device = device or {}
+    return {
+        "date": now.strftime("%Y-%m-%d"),
+        "year": now.strftime("%Y"),
+        "month": now.strftime("%Y-%m"),
+        "location": device.get("location") or "Unspecified",
+        "device": device.get("name") or device.get("ip") or "Unspecified",
+        "ip": device.get("ip") or "Unspecified",
+        "role": device.get("role") or "Unspecified",
+        "profile": profile or "Unspecified",
+        "collection_id": collection_id or "Unspecified",
+    }
+
+
+def describe_storage_level(level_def):
+    labels = []
+    for part in level_def.get("parts", []):
+        if part.get("type") == "token":
+            labels.append(f"[{STORAGE_TOKEN_LABELS.get(part.get('value'), part.get('value', 'Field'))}]")
+        else:
+            value = str(part.get("value", ""))
+            if value:
+                labels.append(repr(value))
+    return " + ".join(labels) if labels else "(empty folder)"
+
+
+def render_storage_level(level_def, values):
+    pieces = []
+    for part in level_def.get("parts", []):
+        if part.get("type") == "token":
+            pieces.append(str(values.get(part.get("value"), "Unspecified")))
+        elif part.get("type") == "text":
+            pieces.append(str(part.get("value", "")))
+    # Sanitize after composing so separators such as '_' and '-' remain intentional.
+    return safe_filename("".join(pieces) or "Unspecified")
+
+
+def build_storage_path(base: Path, levels, values):
+    path = Path(base)
+    for level_def in levels:
+        path = path / render_storage_level(level_def, values)
+    return path
+
+
+def build_storage_path_to_depth(base: Path, levels, depth: int, values):
+    """Resolve a save point where depth=0 is Base and depth=N is after N folder levels."""
+    depth = max(0, min(int(depth), len(levels)))
+    return build_storage_path(base, levels[:depth], values)
+
+
+def storage_level_tokens(level_def):
+    return {
+        part.get("value")
+        for part in level_def.get("parts", [])
+        if part.get("type") == "token"
+    }
+
+
+def valid_collection_storage_depths(levels):
+    """Collection-wide files cannot resolve paths after a device-scoped folder level."""
+    valid = [0]
+    for idx, level_def in enumerate(levels, 1):
+        if storage_level_tokens(level_def) & DEVICE_SCOPED_STORAGE_TOKENS:
+            break
+        valid.append(idx)
+    return valid
+
+
+def normalize_storage_layout(layout):
+    """Migrate v0.8 run/device layouts into the v0.9 single-hierarchy save-point model."""
+    layout = clone_layout(layout or {})
+    if "levels" in layout:
+        levels = layout.get("levels", [])
+        dest = layout.setdefault("destinations", {})
+        count = len(levels)
+        dest.setdefault("manifest", min(count, 0))
+        dest.setdefault("summary", dest.get("manifest", 0))
+        dest.setdefault("device_files", count)
+        for key in ("manifest", "summary", "device_files"):
+            try:
+                dest[key] = max(0, min(int(dest.get(key, 0)), count))
+            except Exception:
+                dest[key] = count if key == "device_files" else 0
+        return layout
+
+    run_levels = layout.get("run_levels", [])
+    device_levels = layout.get("device_levels", [])
+    levels = clone_layout(run_levels) + clone_layout(device_levels)
+    run_depth = len(run_levels)
+    return {
+        "levels": levels,
+        "destinations": {
+            "manifest": run_depth,
+            "summary": run_depth,
+            "device_files": len(levels),
+        },
+    }
+
+
+def storage_depth_label(depth, levels):
+    if int(depth) == 0:
+        return "Base Folder"
+    idx = int(depth) - 1
+    if 0 <= idx < len(levels):
+        return f"After {depth} · {describe_storage_level(levels[idx])}"
+    return f"After {depth} folder levels"
+
+
+def common_artifact_directory(paths, fallback):
+    dirs = [str(Path(x).parent) for x in paths if x]
+    if not dirs:
+        return Path(fallback)
+    try:
+        return Path(os.path.commonpath(dirs))
+    except Exception:
+        return Path(fallback)
+
+
+def local_timestamp():
+    """Timezone-aware local ISO-8601 timestamp with millisecond precision."""
+    return datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+
+def normalize_cli_command(command: str) -> str:
+    """Normalize spacing/case only for command identity checks; never modifies saved output."""
+    return " ".join(str(command or "").strip().lower().split())
+
+
+def is_full_running_config_command(command: str) -> bool:
+    return normalize_cli_command(command) in RUNNING_CONFIG_COMMANDS
+
+
+def build_running_config_cfg(output: str) -> str:
+    """
+    Build the standalone recovery .cfg from the already-preserved command output.
+
+    commands[].output remains untouched. For the convenience .cfg only, remove Cisco's
+    display-only preamble lines that are not configuration statements:
+        Building configuration...
+        Current configuration : <n> bytes
+
+    The remaining configuration body is preserved line-for-line and terminated with a newline.
+    """
+    lines = str(output or "").splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+
+    while lines:
+        stripped = lines[0].strip()
+        low = stripped.lower()
+        if low == "building configuration..." or re.match(r"^current configuration\s*:\s*\d+\s*bytes\s*$", low):
+            lines.pop(0)
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            continue
+        break
+
+    cfg = "\n".join(lines)
+    if cfg and not cfg.endswith("\n"):
+        cfg += "\n"
+    return cfg
+
+
+def find_running_config_entry(result: dict):
+    """Return the first successful full running-config command entry, if one exists."""
+    for entry in result.get("commands", []):
+        if entry.get("status") == "success" and is_full_running_config_command(entry.get("command", "")):
+            return entry
+    return None
+
+
+def command_set_sha256(commands) -> str:
+    canonical = json.dumps(list(commands), ensure_ascii=False, separators=(",", ":"))
+    return sha256_bytes(canonical.encode("utf-8"))
+
+
+def classify_command_exception(exc) -> str:
+    text = f"{exc.__class__.__name__} {exc}".lower()
+    return "timeout" if "timeout" in text or "timed out" in text else "execution_error"
+
+
+def normalize_header(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def profile_files():
+    return sorted(PROFILE_DIR.glob("*.txt"), key=lambda p: p.name.lower())
+
+
+def load_profile(profile_path: Path):
+    commands = []
+    for raw in profile_path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        commands.append(line)
+
+    metadata = {}
+    meta_path = profile_path.with_suffix(".json")
+    if meta_path.exists():
+        metadata = load_json(meta_path, {})
+    return commands, metadata
+
+
+def is_read_only(command: str) -> bool:
+    low = command.strip().lower()
+    return any(low == p.strip() or low.startswith(p) for p in READ_ONLY_PREFIXES)
+
+
+def cli_output_indicates_error(output: str) -> bool:
+    low = output.lower()
+    return any(pattern.lower() in low for pattern in COMMAND_ERROR_PATTERNS)
+
+
+def ping_host(host: str, timeout_ms: int = 2000):
+    system = platform.system().lower()
+    if system == "windows":
+        cmd = ["ping", "-n", "1", "-w", str(timeout_ms), host]
+    else:
+        seconds = max(1, int(round(timeout_ms / 1000)))
+        cmd = ["ping", "-c", "1", "-W", str(seconds), host]
+
+    started = time.perf_counter()
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=max(3, timeout_ms / 1000 + 2),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        duration = time.perf_counter() - started
+        text = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode == 0, duration, text.strip()
+    except Exception as exc:
+        return False, time.perf_counter() - started, str(exc)
+
+
+def tcp_22_test(host: str, timeout: float = 5.0):
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((host, 22), timeout=timeout):
+            pass
+        return True, time.perf_counter() - started, ""
+    except Exception as exc:
+        return False, time.perf_counter() - started, str(exc)
+
+
+def require_openpyxl(parent=None):
+    if Workbook is not None and load_workbook is not None:
+        return True
+    messagebox.showerror(
+        "Excel support not installed",
+        "Excel import/export requires openpyxl.\n\nInstall it with:\n\npip install openpyxl",
+        parent=parent,
+    )
+    return False
+
+
+def write_device_workbook(path: Path, devices=None, template=False):
+    if Workbook is None:
+        raise RuntimeError("openpyxl is not installed")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Devices"
+
+    for col, header in enumerate(DEVICE_EXCEL_HEADERS, 1):
+        cell = ws.cell(row=1, column=col, value=header)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1F4E78")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    rows = []
+    if devices:
+        for dev in devices:
+            rows.append([
+                dev.get("name", ""),
+                dev.get("ip", ""),
+                dev.get("location", dev.get("group", "")),
+                dev.get("role", ""),
+                dev.get("device_type", "cisco_ios") or "cisco_ios",
+                dev.get("notes", ""),
+            ])
+    elif template:
+        rows = [
+            ["EXAMPLE-ACC01", "10.10.10.10", "Building A", "Access", "cisco_ios", "Example row - replace or delete"],
+            ["", "", "", "", "cisco_ios", ""],
+            ["", "", "", "", "cisco_ios", ""],
+        ]
+
+    for row in rows:
+        ws.append(row)
+
+    if ws.max_row >= 2:
+        ref = f"A1:F{max(ws.max_row, 2)}"
+        table = Table(displayName="DeviceLibrary", ref=ref)
+        table.tableStyleInfo = TableStyleInfo(
+            name="TableStyleMedium2",
+            showFirstColumn=False,
+            showLastColumn=False,
+            showRowStripes=True,
+            showColumnStripes=False,
+        )
+        ws.add_table(table)
+
+    widths = {"A": 24, "B": 18, "C": 22, "D": 18, "E": 20, "F": 38}
+    for col, width in widths.items():
+        ws.column_dimensions[col].width = width
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:F{max(ws.max_row, 1)}"
+
+    instructions = wb.create_sheet("Instructions")
+    instructions["A1"] = "Netmiko Universal Collector - Device Library Template"
+    instructions["A1"].font = Font(bold=True, size=14)
+    instructions["A3"] = "Required fields"
+    instructions["A3"].font = Font(bold=True)
+    instructions["A4"] = "Name / Alias"
+    instructions["B4"] = "Friendly name shown in the collector."
+    instructions["A5"] = "IP Address"
+    instructions["B5"] = "SSH target IP address."
+    instructions["A7"] = "Optional fields"
+    instructions["A7"].font = Font(bold=True)
+    instructions["A8"] = "Location"
+    instructions["B8"] = "Building, city, lab, closet area, remote site, etc."
+    instructions["A9"] = "Role"
+    instructions["B9"] = "Access, Distribution, Core, Router, Firewall, etc."
+    instructions["A10"] = "Device Type"
+    instructions["B10"] = "Netmiko device_type. Defaults to cisco_ios if blank."
+    instructions["A11"] = "Notes"
+    instructions["B11"] = "Free-form notes for teammates."
+    instructions["A13"] = "Credentials are intentionally NOT stored in this workbook."
+    instructions["A14"] = "Save the workbook, then use File > Import Devices > Excel in the collector."
+    instructions.column_dimensions["A"].width = 24
+    instructions.column_dimensions["B"].width = 70
+
+    wb.save(path)
+
+
+def read_device_workbook(path: Path):
+    if load_workbook is None:
+        raise RuntimeError("openpyxl is not installed")
+
+    wb = load_workbook(path, data_only=True)
+    if "Devices" in wb.sheetnames:
+        ws = wb["Devices"]
+    else:
+        ws = wb[wb.sheetnames[0]]
+
+    header_map = {}
+    for col in range(1, ws.max_column + 1):
+        header_map[normalize_header(ws.cell(row=1, column=col).value)] = col
+
+    aliases = {
+        "name": ["namealias", "name", "alias", "hostname", "device"],
+        "ip": ["ipaddress", "ip", "address", "host"],
+        "location": ["location", "site", "group"],
+        "role": ["role", "type", "devicefunction"],
+        "device_type": ["devicetype", "netmikodevicetype", "netmikotype"],
+        "notes": ["notes", "description", "comments"],
+    }
+
+    resolved = {}
+    for key, candidates in aliases.items():
+        for candidate in candidates:
+            if candidate in header_map:
+                resolved[key] = header_map[candidate]
+                break
+
+    if "name" not in resolved or "ip" not in resolved:
+        raise ValueError("Excel file must contain Name / Alias and IP Address columns.")
+
+    devices = []
+    for row in range(2, ws.max_row + 1):
+        name = str(ws.cell(row=row, column=resolved["name"]).value or "").strip()
+        ip = str(ws.cell(row=row, column=resolved["ip"]).value or "").strip()
+        if not name and not ip:
+            continue
+        if not name or not ip:
+            continue
+
+        def cell_value(key, default=""):
+            col = resolved.get(key)
+            if not col:
+                return default
+            return str(ws.cell(row=row, column=col).value or default).strip()
+
+        devices.append({
+            "name": name,
+            "ip": ip,
+            "location": cell_value("location"),
+            "role": cell_value("role"),
+            "device_type": cell_value("device_type", "cisco_ios") or "cisco_ios",
+            "notes": cell_value("notes"),
+        })
+
+    return devices
+
+
+# -----------------------------------------------------------------------------
+# Dialogs
+# -----------------------------------------------------------------------------
+
+class DeviceDialog(tk.Toplevel):
+    def __init__(self, master, title, initial=None, on_save=None):
+        super().__init__(master)
+        self.title(title)
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.on_save = on_save
+        initial = initial or {}
+
+        self.vars = {
+            "name": tk.StringVar(value=initial.get("name", "")),
+            "ip": tk.StringVar(value=initial.get("ip", "")),
+            "location": tk.StringVar(value=initial.get("location", initial.get("group", ""))),
+            "role": tk.StringVar(value=initial.get("role", "")),
+            "device_type": tk.StringVar(value=initial.get("device_type", "cisco_ios")),
+            "notes": tk.StringVar(value=initial.get("notes", "")),
+        }
+
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill="both", expand=True)
+        fields = [
+            ("Name / Alias", "name"),
+            ("IP Address", "ip"),
+            ("Location", "location"),
+            ("Role", "role"),
+            ("Netmiko Device Type", "device_type"),
+            ("Notes", "notes"),
+        ]
+        for row, (label, key) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=self.vars[key], width=40).grid(
+                row=row, column=1, sticky="ew", padx=(10, 0), pady=4
+            )
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=len(fields), column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Save", command=self.save).pack(side="right", padx=(0, 8))
+        self.bind("<Return>", lambda _e: self.save())
+        self.bind("<Escape>", lambda _e: self.destroy())
+        self.wait_visibility()
+        self.focus_force()
+
+    def save(self):
+        data = {key: var.get().strip() for key, var in self.vars.items()}
+        if not data["name"] or not data["ip"]:
+            messagebox.showwarning("Missing information", "Name and IP Address are required.", parent=self)
+            return
+        if not data["device_type"]:
+            data["device_type"] = "cisco_ios"
+        if self.on_save:
+            self.on_save(data)
+        self.destroy()
+
+
+class CredentialPrompt(tk.Toplevel):
+    """Temporary run-time credential/token prompt. Nothing entered here is saved."""
+    def __init__(self, master, preset_name=None, preset=None, manual=False, use_token=False):
+        super().__init__(master)
+        self.title("Connection Credentials")
+        self.resizable(False, False)
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+        preset = preset or {}
+
+        frame = ttk.Frame(self, padding=16)
+        frame.pack(fill="both", expand=True)
+
+        if manual:
+            ttk.Label(frame, text="Manual credentials", style="Heading.TLabel").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 8)
+            )
+            self.user_var = tk.StringVar()
+            self.pass_var = tk.StringVar()
+            ttk.Label(frame, text="Username").grid(row=1, column=0, sticky="w", pady=4)
+            user_entry = ttk.Entry(frame, textvariable=self.user_var, width=36)
+            user_entry.grid(row=1, column=1, padx=(10, 0), pady=4)
+            ttk.Label(frame, text="Password").grid(row=2, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=self.pass_var, show="*", width=36).grid(
+                row=2, column=1, padx=(10, 0), pady=4
+            )
+            next_row = 3
+        else:
+            self.user_var = tk.StringVar(value=preset.get("username", ""))
+            self.pass_var = tk.StringVar(value=preset.get("password_base", ""))
+            ttk.Label(frame, text=f"Preset: {preset_name}", style="Heading.TLabel").grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 5)
+            )
+            ttk.Label(
+                frame,
+                text=f"Username: {preset.get('username', '') or '(not configured)'}",
+                style="Muted.TLabel",
+            ).grid(row=1, column=0, columnspan=2, sticky="w")
+            next_row = 2
+
+        self.token_var = tk.StringVar()
+        if use_token:
+            ttk.Label(frame, text="Token / Suffix").grid(row=next_row, column=0, sticky="w", pady=(8, 4))
+            token_entry = ttk.Entry(frame, textvariable=self.token_var, show="*", width=36)
+            token_entry.grid(row=next_row, column=1, padx=(10, 0), pady=(8, 4))
+            if not manual:
+                token_entry.focus_set()
+            next_row += 1
+
+        ttk.Label(
+            frame,
+            text="Temporary for this action only. Token is appended to the base password.",
+            style="Muted.TLabel",
+        ).grid(row=next_row, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        next_row += 1
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=next_row, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right")
+        ttk.Button(buttons, text="Continue", command=self.submit).pack(side="right", padx=(0, 8))
+
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.bind("<Escape>", lambda _e: self.cancel())
+        self.bind("<Return>", lambda _e: self.submit())
+        self.wait_visibility()
+        if manual:
+            user_entry.focus_set()
+        self.wait_window(self)
+
+    def submit(self):
+        user = self.user_var.get().strip()
+        password = self.pass_var.get()
+        token = self.token_var.get()
+        if not user or not password:
+            messagebox.showwarning("Credentials", "Username and password are required.", parent=self)
+            return
+        self.result = {"username": user, "password": password + token, "token_used": bool(token)}
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class CredentialDialog(tk.Toplevel):
+    """Manage saved local credential presets."""
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Credential Presets")
+        self.geometry("660x430")
+        self.transient(master)
+        self.grab_set()
+        self.master_app = master
+        self.data = master.credentials
+
+        outer = ttk.Frame(self, padding=12)
+        outer.pack(fill="both", expand=True)
+        left = ttk.Frame(outer)
+        left.pack(side="left", fill="y")
+        right = ttk.Frame(outer)
+        right.pack(side="left", fill="both", expand=True, padx=(14, 0))
+
+        ttk.Label(left, text="Saved Presets", style="Heading.TLabel").pack(anchor="w")
+        self.listbox = tk.Listbox(left, width=24, height=16)
+        self.listbox.pack(fill="y", expand=True, pady=(6, 8))
+        self.listbox.bind("<<ListboxSelect>>", self.load_selected)
+
+        row = ttk.Frame(left)
+        row.pack(fill="x")
+        ttk.Button(row, text="+ New", command=self.new_preset).pack(side="left")
+        ttk.Button(row, text="Delete", command=self.delete_preset).pack(side="left", padx=(5, 0))
+
+        self.name_var = tk.StringVar()
+        self.user_var = tk.StringVar()
+        self.pass_var = tk.StringVar()
+        self.desc_var = tk.StringVar()
+        self.default_var = tk.BooleanVar()
+
+        for r, (label, var, secret) in enumerate([
+            ("Preset Name", self.name_var, False),
+            ("Username", self.user_var, False),
+            ("Base Password", self.pass_var, True),
+            ("Description", self.desc_var, False),
+        ]):
+            ttk.Label(right, text=label).grid(row=r, column=0, sticky="w", pady=5)
+            ttk.Entry(right, textvariable=var, show="*" if secret else "", width=38).grid(
+                row=r, column=1, sticky="ew", padx=(10, 0), pady=5
+            )
+
+        ttk.Checkbutton(right, text="Default preset", variable=self.default_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(10, 4)
+        )
+        ttk.Label(
+            right,
+            text=(
+                "Alpha note: saved passwords remain local in credentials.json as plain text. "
+                "Do not share that file. A later version should move secrets to Windows Credential Manager."
+            ),
+            style="Muted.TLabel",
+            wraplength=370,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(12, 10))
+        ttk.Button(right, text="Save Preset", command=self.save_preset).grid(
+            row=6, column=0, columnspan=2, sticky="e"
+        )
+        right.columnconfigure(1, weight=1)
+        self.refresh_list()
+
+    def refresh_list(self):
+        self.listbox.delete(0, "end")
+        default = self.data.get("default_profile", self.data.get("general_profile", ""))
+        for name in sorted(self.data.get("presets", {}).keys(), key=str.lower):
+            marker = "  [Default]" if name == default else ""
+            self.listbox.insert("end", name + marker)
+
+    def selected_name(self):
+        sel = self.listbox.curselection()
+        if not sel:
+            return None
+        return self.listbox.get(sel[0]).replace("  [Default]", "")
+
+    def load_selected(self, _event=None):
+        name = self.selected_name()
+        if not name:
+            return
+        preset = self.data.get("presets", {}).get(name, {})
+        self.name_var.set(name)
+        self.user_var.set(preset.get("username", ""))
+        self.pass_var.set(preset.get("password_base", ""))
+        self.desc_var.set(preset.get("description", ""))
+        default = self.data.get("default_profile", self.data.get("general_profile", ""))
+        self.default_var.set(name == default)
+
+    def new_preset(self):
+        self.name_var.set("")
+        self.user_var.set("")
+        self.pass_var.set("")
+        self.desc_var.set("")
+        self.default_var.set(False)
+
+    def delete_preset(self):
+        name = self.selected_name()
+        if not name:
+            return
+        if not messagebox.askyesno("Delete preset", f"Delete credential preset '{name}'?", parent=self):
+            return
+        self.data.get("presets", {}).pop(name, None)
+        default = self.data.get("default_profile", self.data.get("general_profile", ""))
+        if default == name:
+            self.data["default_profile"] = next(iter(self.data.get("presets", {})), "")
+        self.data.pop("general_profile", None)
+        atomic_write_json(CREDENTIAL_FILE, self.data)
+        self.master_app.credentials = self.data
+        self.master_app.refresh_auth_presets()
+        self.refresh_list()
+        self.new_preset()
+
+    def save_preset(self):
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showwarning("Preset name", "Enter a preset name.", parent=self)
+            return
+        self.data.setdefault("presets", {})[name] = {
+            "username": self.user_var.get().strip(),
+            "password_base": self.pass_var.get(),
+            "description": self.desc_var.get().strip(),
+        }
+        if self.default_var.get() or not self.data.get("default_profile"):
+            self.data["default_profile"] = name
+        self.data.pop("general_profile", None)
+        atomic_write_json(CREDENTIAL_FILE, self.data)
+        self.master_app.credentials = self.data
+        self.master_app.refresh_auth_presets()
+        self.refresh_list()
+        messagebox.showinfo("Saved", f"Credential preset '{name}' saved locally.", parent=self)
+
+
+class CommandsDialog(tk.Toplevel):
+    def __init__(self, master, initial_commands):
+        super().__init__(master)
+        self.title("One-off Commands")
+        self.geometry("560x390")
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+
+        frame = ttk.Frame(self, padding=14)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Additional commands", style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(
+            frame,
+            text="Optional. These run after the selected TXT profile and are not written back to that profile.",
+            style="Muted.TLabel",
+            wraplength=500,
+        ).pack(anchor="w", pady=(3, 8))
+        self.text = tk.Text(frame, wrap="none", font=("Consolas", 9))
+        self.text.pack(fill="both", expand=True)
+        self.text.insert("1.0", "\n".join(initial_commands))
+
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", pady=(8, 0))
+        ttk.Button(buttons, text="Clear", command=lambda: self.text.delete("1.0", "end")).pack(side="left")
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(side="right")
+        ttk.Button(buttons, text="Save", command=self.submit).pack(side="right", padx=(0, 8))
+        self.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.wait_window(self)
+
+    def submit(self):
+        self.result = [
+            line.strip() for line in self.text.get("1.0", "end").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.destroy()
+
+    def cancel(self):
+        self.result = None
+        self.destroy()
+
+
+# -----------------------------------------------------------------------------
+# Application
+# -----------------------------------------------------------------------------
+
+class ReorderLevelListbox(tk.Listbox):
+    """Listbox that keeps folder-level definitions and supports drag-to-reorder."""
+    def __init__(self, master, on_change=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.levels = []
+        self.on_change = on_change
+        self._drag_index = None
+        self.bind("<ButtonPress-1>", self._drag_start, add="+")
+        self.bind("<B1-Motion>", self._drag_motion, add="+")
+
+    def set_levels(self, levels):
+        self.levels = clone_layout(levels)
+        self.refresh()
+
+    def get_levels(self):
+        return clone_layout(self.levels)
+
+    def refresh(self):
+        selected = self.curselection()
+        selected_index = selected[0] if selected else None
+        self.delete(0, "end")
+        for i, level_def in enumerate(self.levels, 1):
+            self.insert("end", f"☰  {i}.  {describe_storage_level(level_def)}")
+        if selected_index is not None and self.levels:
+            selected_index = min(selected_index, len(self.levels) - 1)
+            self.selection_set(selected_index)
+            self.activate(selected_index)
+
+    def selected_index(self):
+        sel = self.curselection()
+        return sel[0] if sel else None
+
+    def _drag_start(self, event):
+        if not self.levels:
+            self._drag_index = None
+            return
+        idx = self.nearest(event.y)
+        if 0 <= idx < len(self.levels):
+            self._drag_index = idx
+
+    def _drag_motion(self, event):
+        if self._drag_index is None or not self.levels:
+            return
+        new_index = self.nearest(event.y)
+        new_index = max(0, min(new_index, len(self.levels) - 1))
+        if new_index == self._drag_index:
+            return
+        item = self.levels.pop(self._drag_index)
+        self.levels.insert(new_index, item)
+        self._drag_index = new_index
+        self.refresh()
+        self.selection_clear(0, "end")
+        self.selection_set(new_index)
+        self.activate(new_index)
+        if self.on_change:
+            self.on_change()
+
+
+class FolderLevelDialog(tk.Toplevel):
+    """Visual editor for one folder level made from field chips and literal text."""
+    def __init__(self, master, allowed_tokens, initial=None, title="Folder Level"):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("660x520")
+        self.minsize(600, 470)
+        self.transient(master)
+        self.grab_set()
+        self.result = None
+        self.allowed_tokens = list(allowed_tokens)
+        self.parts = clone_layout((initial or {"parts": []}).get("parts", []))
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text="Build this folder name", style="Heading.TLabel").pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="Add fields and optional text. The collector handles Windows-safe folder names automatically.",
+            style="Muted.TLabel",
+            wraplength=610,
+        ).pack(anchor="w", pady=(2, 10))
+
+        field_box = ttk.LabelFrame(outer, text="Available Fields", padding=8)
+        field_box.pack(fill="x")
+        for i, token in enumerate(self.allowed_tokens):
+            ttk.Button(
+                field_box,
+                text=STORAGE_TOKEN_LABELS[token],
+                command=lambda t=token: self.add_token(t),
+            ).grid(row=i // 4, column=i % 4, padx=3, pady=3, sticky="ew")
+        for col in range(4):
+            field_box.columnconfigure(col, weight=1)
+
+        parts_box = ttk.LabelFrame(outer, text="Folder Name Parts", padding=8)
+        parts_box.pack(fill="both", expand=True, pady=(10, 8))
+        self.parts_list = tk.Listbox(parts_box, height=9, font=("Segoe UI", 9), activestyle="none")
+        self.parts_list.pack(side="left", fill="both", expand=True)
+        controls = ttk.Frame(parts_box)
+        controls.pack(side="left", fill="y", padx=(8, 0))
+        ttk.Button(controls, text="+ Text", command=self.add_text).pack(fill="x", pady=(0, 4))
+        ttk.Button(controls, text="Edit Text", command=self.edit_text).pack(fill="x", pady=4)
+        ttk.Button(controls, text="Move Up", command=lambda: self.move_part(-1)).pack(fill="x", pady=4)
+        ttk.Button(controls, text="Move Down", command=lambda: self.move_part(1)).pack(fill="x", pady=4)
+        ttk.Button(controls, text="Remove", command=self.remove_part).pack(fill="x", pady=4)
+
+        preview_box = ttk.Frame(outer)
+        preview_box.pack(fill="x", pady=(4, 8))
+        ttk.Label(preview_box, text="Preview", style="Heading.TLabel").pack(side="left")
+        self.preview_var = tk.StringVar()
+        ttk.Label(preview_box, textvariable=self.preview_var, style="Muted.TLabel").pack(side="left", padx=(10, 0))
+
+        buttons = ttk.Frame(outer)
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="Save Folder Level", command=self.save).pack(side="right", padx=(0, 8))
+
+        self.refresh_parts()
+        self.wait_visibility()
+        self.focus_force()
+
+    def add_token(self, token):
+        self.parts.append(token_part(token))
+        self.refresh_parts(select=len(self.parts) - 1)
+
+    def add_text(self):
+        value = simpledialog.askstring(
+            "Add Text",
+            "Literal text to include in the folder name (for example _ or -Archive):",
+            parent=self,
+        )
+        if value is not None and value != "":
+            self.parts.append(text_part(value))
+            self.refresh_parts(select=len(self.parts) - 1)
+
+    def edit_text(self):
+        idx = self.selected_part()
+        if idx is None or self.parts[idx].get("type") != "text":
+            messagebox.showinfo("Edit Text", "Select a text part first.", parent=self)
+            return
+        old = self.parts[idx].get("value", "")
+        value = simpledialog.askstring("Edit Text", "Text:", initialvalue=old, parent=self)
+        if value is not None:
+            self.parts[idx] = text_part(value)
+            self.refresh_parts(select=idx)
+
+    def selected_part(self):
+        sel = self.parts_list.curselection()
+        return sel[0] if sel else None
+
+    def move_part(self, direction):
+        idx = self.selected_part()
+        if idx is None:
+            return
+        new = idx + direction
+        if 0 <= new < len(self.parts):
+            self.parts[idx], self.parts[new] = self.parts[new], self.parts[idx]
+            self.refresh_parts(select=new)
+
+    def remove_part(self):
+        idx = self.selected_part()
+        if idx is None:
+            return
+        self.parts.pop(idx)
+        self.refresh_parts(select=min(idx, len(self.parts) - 1) if self.parts else None)
+
+    def refresh_parts(self, select=None):
+        self.parts_list.delete(0, "end")
+        for part in self.parts:
+            if part.get("type") == "token":
+                label = STORAGE_TOKEN_LABELS.get(part.get("value"), part.get("value", "Field"))
+                self.parts_list.insert("end", f"FIELD   [{label}]")
+            else:
+                self.parts_list.insert("end", f"TEXT     {part.get('value', '')!r}")
+        if select is not None and 0 <= select < len(self.parts):
+            self.parts_list.selection_set(select)
+            self.parts_list.activate(select)
+
+        example_now = datetime(2026, 10, 19, 19, 22).astimezone()
+        values = storage_token_values(
+            example_now,
+            "General Switch",
+            "20261019_192200",
+            {"name": "ACC01", "ip": "10.20.30.40", "location": "Building A", "role": "Access"},
+        )
+        self.preview_var.set(render_storage_level({"parts": self.parts}, values) if self.parts else "(empty)")
+
+    def save(self):
+        if not self.parts:
+            messagebox.showwarning("Folder Level", "Add at least one field or text part.", parent=self)
+            return
+        self.result = {"parts": clone_layout(self.parts)}
+        self.destroy()
+
+
+class StorageLayoutDialog(tk.Toplevel):
+    """One visual folder hierarchy with independent save points for output artifact groups."""
+    def __init__(self, master):
+        super().__init__(master)
+        self.title("Collection Storage Layout")
+        self.geometry("1060x760")
+        self.minsize(920, 680)
+        self.transient(master)
+        self.grab_set()
+        self.master_app = master
+
+        raw_custom = clone_layout(master.settings.get("storage_custom_presets", {}))
+        self.custom_presets = {
+            name: normalize_storage_layout(layout) for name, layout in raw_custom.items()
+        }
+        self.layout = normalize_storage_layout(master.settings.get("storage_layout", DEFAULT_STORAGE_LAYOUT))
+
+        outer = ttk.Frame(self, padding=14)
+        outer.pack(fill="both", expand=True)
+
+        top = ttk.Frame(outer)
+        top.pack(fill="x")
+        ttk.Label(top, text="Collection Storage", style="Title.TLabel").pack(side="left")
+        ttk.Label(
+            top,
+            text="Build one folder hierarchy, then choose where each output set is saved.",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=(12, 0), pady=(6, 0))
+
+        base_card = ttk.LabelFrame(outer, text="Base Folder & Preset", padding=10)
+        base_card.pack(fill="x", pady=(10, 8))
+        ttk.Label(base_card, text="Base Folder").grid(row=0, column=0, sticky="w")
+        self.base_var = tk.StringVar(value=master.settings.get("output_directory", str(OUTPUT_DIR)))
+        ttk.Entry(base_card, textvariable=self.base_var).grid(row=0, column=1, sticky="ew", padx=(8, 6))
+        ttk.Button(base_card, text="Browse...", command=self.browse_base).grid(row=0, column=2)
+        ttk.Label(base_card, text="Preset").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        saved_name = master.settings.get("storage_layout_name", "By Collection")
+        self.preset_var = tk.StringVar(value=saved_name)
+        self.preset_combo = ttk.Combobox(base_card, textvariable=self.preset_var, state="readonly")
+        self.preset_combo.grid(row=1, column=1, sticky="w", padx=(8, 6), pady=(8, 0))
+        self.preset_combo.bind("<<ComboboxSelected>>", self.on_preset_selected)
+        ttk.Button(base_card, text="Save Current as Preset...", command=self.save_custom_preset).grid(row=1, column=2, pady=(8, 0))
+        base_card.columnconfigure(1, weight=1)
+        self.base_var.trace_add("write", lambda *_: self.update_preview())
+
+        builder = ttk.Frame(outer)
+        builder.pack(fill="both", expand=True)
+        builder.columnconfigure(0, weight=3)
+        builder.columnconfigure(1, weight=2)
+        builder.rowconfigure(0, weight=1)
+
+        hierarchy_card = ttk.LabelFrame(builder, text="Folder Hierarchy", padding=10)
+        hierarchy_card.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        ttk.Label(
+            hierarchy_card,
+            text="Drag levels to reorder them. A folder level can combine fields and text.",
+            style="Muted.TLabel",
+            wraplength=530,
+        ).pack(anchor="w", pady=(0, 6))
+        self.level_list = ReorderLevelListbox(
+            hierarchy_card, on_change=self.on_layout_changed, height=13,
+            font=("Segoe UI", 9), activestyle="none"
+        )
+        self.level_list.pack(fill="both", expand=True)
+        self.level_list.bind("<Double-1>", lambda _e: self.edit_level(), add="+")
+
+        level_buttons = ttk.Frame(hierarchy_card)
+        level_buttons.pack(fill="x", pady=(7, 0))
+        ttk.Button(level_buttons, text="+ Add Folder", command=self.add_level).pack(side="left")
+        ttk.Button(level_buttons, text="Edit", command=self.edit_level).pack(side="left", padx=4)
+        ttk.Button(level_buttons, text="Remove", command=self.remove_level).pack(side="left")
+        ttk.Button(level_buttons, text="↑", width=3, command=lambda: self.move_level(-1)).pack(side="right")
+        ttk.Button(level_buttons, text="↓", width=3, command=lambda: self.move_level(1)).pack(side="right", padx=(0, 4))
+
+        placement_card = ttk.LabelFrame(builder, text="File Placement", padding=10)
+        placement_card.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        ttk.Label(
+            placement_card,
+            text=(
+                "Choose the save point for each output set. Device Capture keeps the per-device "
+                "JSON, LOG, and CFG together."
+            ),
+            style="Muted.TLabel",
+            wraplength=360,
+        ).pack(anchor="w", pady=(0, 10))
+
+        self.manifest_dest_var = tk.StringVar()
+        self.summary_dest_var = tk.StringVar()
+        self.device_dest_var = tk.StringVar()
+        self.manifest_combo = self._placement_row(placement_card, "Manifest JSON", self.manifest_dest_var)
+        self.summary_combo = self._placement_row(placement_card, "Summary LOG", self.summary_dest_var)
+        self.device_combo = self._placement_row(placement_card, "Device Capture", self.device_dest_var)
+
+        ttk.Separator(placement_card).pack(fill="x", pady=12)
+        ttk.Label(
+            placement_card,
+            text=(
+                "Collection-wide files cannot be placed after a folder that uses Location, Device, IP, "
+                "or Role, because one run may contain multiple values. Device captures can use any save point."
+            ),
+            style="Muted.TLabel",
+            wraplength=360,
+        ).pack(anchor="w")
+
+        self._manifest_map = {}
+        self._summary_map = {}
+        self._device_map = {}
+        self.manifest_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_destination_changed())
+        self.summary_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_destination_changed())
+        self.device_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_destination_changed())
+
+        preview_card = ttk.LabelFrame(outer, text="Live Preview", padding=10)
+        preview_card.pack(fill="x", pady=(8, 8))
+        self.preview_text = tk.Text(preview_card, height=10, wrap="none", font=("Consolas", 9), bg="#ffffff")
+        self.preview_text.pack(fill="x")
+        self.preview_text.configure(state="disabled")
+
+        footer = ttk.Frame(outer)
+        footer.pack(fill="x")
+        ttk.Button(footer, text="Reset to Default", command=self.reset_default).pack(side="left")
+        ttk.Button(footer, text="Cancel", command=self.destroy).pack(side="right")
+        ttk.Button(footer, text="Apply", command=self.apply).pack(side="right", padx=(0, 8))
+
+        self.refresh_preset_values()
+        self.level_list.set_levels(self.layout.get("levels", []))
+        self.refresh_destination_choices(self.layout.get("destinations", {}))
+        self.update_preview()
+        self.wait_visibility()
+        self.focus_force()
+
+    def _placement_row(self, parent, label, variable):
+        frame = ttk.Frame(parent)
+        frame.pack(fill="x", pady=4)
+        ttk.Label(frame, text=label, width=16).pack(side="left")
+        combo = ttk.Combobox(frame, textvariable=variable, state="readonly")
+        combo.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        return combo
+
+    def refresh_preset_values(self):
+        values = list(STORAGE_LAYOUT_PRESETS.keys()) + sorted(self.custom_presets.keys(), key=str.lower) + ["Custom"]
+        self.preset_combo.configure(values=values)
+        if self.preset_var.get() not in values:
+            self.preset_var.set("Custom")
+
+    def _depth_map(self, depths):
+        levels = self.level_list.get_levels()
+        return {storage_depth_label(depth, levels): depth for depth in depths}
+
+    @staticmethod
+    def _choose_label(mapping, desired_depth):
+        if not mapping:
+            return ""
+        for label, depth in mapping.items():
+            if depth == desired_depth:
+                return label
+        # If a reorder makes a collection-wide destination invalid, fall back to the
+        # deepest valid save point at or above the previous depth.
+        allowed = sorted(set(mapping.values()))
+        candidates = [x for x in allowed if x <= desired_depth]
+        target = max(candidates) if candidates else min(allowed)
+        for label, depth in mapping.items():
+            if depth == target:
+                return label
+        return next(iter(mapping))
+
+    def selected_destinations(self):
+        return {
+            "manifest": self._manifest_map.get(self.manifest_dest_var.get(), 0),
+            "summary": self._summary_map.get(self.summary_dest_var.get(), 0),
+            "device_files": self._device_map.get(self.device_dest_var.get(), len(self.level_list.get_levels())),
+        }
+
+    def refresh_destination_choices(self, desired=None):
+        desired = desired or self.selected_destinations()
+        levels = self.level_list.get_levels()
+        global_depths = valid_collection_storage_depths(levels)
+        all_depths = list(range(0, len(levels) + 1))
+
+        self._manifest_map = self._depth_map(global_depths)
+        self._summary_map = self._depth_map(global_depths)
+        self._device_map = self._depth_map(all_depths)
+
+        self.manifest_combo.configure(values=list(self._manifest_map.keys()))
+        self.summary_combo.configure(values=list(self._summary_map.keys()))
+        self.device_combo.configure(values=list(self._device_map.keys()))
+
+        self.manifest_dest_var.set(self._choose_label(self._manifest_map, int(desired.get("manifest", 0))))
+        self.summary_dest_var.set(self._choose_label(self._summary_map, int(desired.get("summary", 0))))
+        self.device_dest_var.set(self._choose_label(self._device_map, int(desired.get("device_files", len(levels)))))
+
+    def current_layout(self):
+        return {
+            "levels": self.level_list.get_levels(),
+            "destinations": self.selected_destinations(),
+        }
+
+    def on_layout_changed(self):
+        old_dest = self.selected_destinations()
+        self.layout = self.current_layout()
+        self.preset_var.set("Custom")
+        self.refresh_destination_choices(old_dest)
+        self.update_preview()
+
+    def on_destination_changed(self):
+        self.layout = self.current_layout()
+        self.preset_var.set("Custom")
+        self.update_preview()
+
+    def on_preset_selected(self, _event=None):
+        name = self.preset_var.get()
+        if name == "Custom":
+            return
+        source = STORAGE_LAYOUT_PRESETS.get(name) or self.custom_presets.get(name)
+        if source:
+            self.layout = normalize_storage_layout(source)
+            self.level_list.set_levels(self.layout.get("levels", []))
+            self.refresh_destination_choices(self.layout.get("destinations", {}))
+            self.update_preview()
+
+    def browse_base(self):
+        selected = filedialog.askdirectory(
+            title="Choose Collection Base Folder",
+            initialdir=self.base_var.get() or str(OUTPUT_DIR),
+        )
+        if selected:
+            self.base_var.set(selected)
+
+    def add_level(self):
+        dialog = FolderLevelDialog(self, STORAGE_TOKENS, title="Add Folder Level")
+        self.wait_window(dialog)
+        if dialog.result:
+            old_dest = self.selected_destinations()
+            self.level_list.levels.append(dialog.result)
+            self.level_list.refresh()
+            self.level_list.selection_set(len(self.level_list.levels) - 1)
+            self.preset_var.set("Custom")
+            self.refresh_destination_choices(old_dest)
+            self.update_preview()
+
+    def edit_level(self):
+        idx = self.level_list.selected_index()
+        if idx is None:
+            return
+        dialog = FolderLevelDialog(
+            self, STORAGE_TOKENS, initial=self.level_list.levels[idx], title="Edit Folder Level"
+        )
+        self.wait_window(dialog)
+        if dialog.result:
+            old_dest = self.selected_destinations()
+            self.level_list.levels[idx] = dialog.result
+            self.level_list.refresh()
+            self.level_list.selection_set(idx)
+            self.preset_var.set("Custom")
+            self.refresh_destination_choices(old_dest)
+            self.update_preview()
+
+    def remove_level(self):
+        idx = self.level_list.selected_index()
+        if idx is None:
+            return
+        old_dest = self.selected_destinations()
+        self.level_list.levels.pop(idx)
+        self.level_list.refresh()
+        self.preset_var.set("Custom")
+        # Destinations are depth-based. Clamp them after removing a folder level.
+        max_depth = len(self.level_list.levels)
+        old_dest = {k: min(v, max_depth) for k, v in old_dest.items()}
+        self.refresh_destination_choices(old_dest)
+        self.update_preview()
+
+    def move_level(self, direction):
+        idx = self.level_list.selected_index()
+        if idx is None:
+            return
+        new = idx + direction
+        if 0 <= new < len(self.level_list.levels):
+            old_dest = self.selected_destinations()
+            self.level_list.levels[idx], self.level_list.levels[new] = self.level_list.levels[new], self.level_list.levels[idx]
+            self.level_list.refresh()
+            self.level_list.selection_clear(0, "end")
+            self.level_list.selection_set(new)
+            self.level_list.activate(new)
+            self.preset_var.set("Custom")
+            self.refresh_destination_choices(old_dest)
+            self.update_preview()
+
+    def save_custom_preset(self):
+        name = simpledialog.askstring("Save Storage Preset", "Preset name:", parent=self)
+        if not name:
+            return
+        if name in STORAGE_LAYOUT_PRESETS:
+            messagebox.showwarning("Preset Name", "That name is reserved for a built-in preset.", parent=self)
+            return
+        self.custom_presets[name] = self.current_layout()
+        self.refresh_preset_values()
+        self.preset_var.set(name)
+
+    def reset_default(self):
+        self.layout = normalize_storage_layout(DEFAULT_STORAGE_LAYOUT)
+        self.level_list.set_levels(self.layout["levels"])
+        self.refresh_destination_choices(self.layout["destinations"])
+        self.preset_var.set("By Collection")
+        self.update_preview()
+
+    def update_preview(self):
+        now = datetime.now().astimezone()
+        collection_id = now.strftime("%Y%m%d_%H%M%S")
+        device = {"name": "ACC01", "ip": "10.20.30.40", "location": "Building A", "role": "Access"}
+        values = storage_token_values(now, "General Switch", collection_id, device)
+        base = Path(self.base_var.get() or str(OUTPUT_DIR))
+        levels = self.level_list.get_levels()
+        dest = self.selected_destinations()
+        max_depth = max(dest.values()) if dest else 0
+
+        lines = [str(base)]
+        indent = ""
+        for depth in range(0, max_depth + 1):
+            file_indent = indent + "    " if depth else "    "
+            if dest.get("manifest") == depth:
+                lines.append(f"{file_indent}[Manifest] Collection_Manifest_General_Switch_{collection_id}.json")
+            if dest.get("summary") == depth:
+                lines.append(f"{file_indent}[Summary ] Collection_Summary_General_Switch_{collection_id}.log")
+            if dest.get("device_files") == depth:
+                lines.append(f"{file_indent}[Device  ] ACC01_General_Switch_{collection_id}.json")
+                lines.append(f"{file_indent}[Device  ] ACC01_General_Switch_{collection_id}.log")
+                lines.append(f"{file_indent}[Config  ] ACC01_running-config_{collection_id}.cfg")
+            if depth < max_depth and depth < len(levels):
+                name = render_storage_level(levels[depth], values)
+                indent += "    "
+                lines.append(f"{indent}└── {name}")
+
+        unused = len(levels) - max_depth
+        if unused > 0:
+            lines.extend(["", f"Note: {unused} folder level(s) are below every save point and will not be created."])
+
+        self.preview_text.configure(state="normal")
+        self.preview_text.delete("1.0", "end")
+        self.preview_text.insert("1.0", "\n".join(lines))
+        self.preview_text.configure(state="disabled")
+
+    def apply(self):
+        base_text = self.base_var.get().strip()
+        if not base_text:
+            messagebox.showwarning("Base Folder", "Choose a base collection folder.", parent=self)
+            return
+        try:
+            base = Path(base_text).expanduser()
+            base.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            messagebox.showerror(
+                "Base Folder",
+                f"The base folder could not be created or accessed:\n\n{exc}",
+                parent=self,
+            )
+            return
+
+        layout = normalize_storage_layout(self.current_layout())
+        levels = layout["levels"]
+        valid_global = set(valid_collection_storage_depths(levels))
+        if layout["destinations"]["manifest"] not in valid_global or layout["destinations"]["summary"] not in valid_global:
+            messagebox.showerror(
+                "Invalid Collection File Placement",
+                "Manifest and Summary cannot be placed beneath a device-specific folder level.",
+                parent=self,
+            )
+            return
+
+        max_used = max(layout["destinations"].values()) if layout["destinations"] else 0
+        if max_used < len(levels):
+            if not messagebox.askyesno(
+                "Unused Folder Levels",
+                f"{len(levels) - max_used} folder level(s) are below every save point and will not be created.\n\n"
+                "Save this layout anyway?",
+                parent=self,
+            ):
+                return
+
+        self.master_app.settings["output_directory"] = str(base)
+        self.master_app.settings["storage_layout"] = layout
+        self.master_app.settings["storage_layout_name"] = self.preset_var.get() or "Custom"
+        self.master_app.settings["storage_custom_presets"] = self.custom_presets
+        atomic_write_json(SETTINGS_FILE, self.master_app.settings)
+        self.master_app.log_ui(
+            f"[SETTINGS] Collection storage layout updated: {self.master_app.settings['storage_layout_name']}"
+        )
+        self.destroy()
+
+
+class CollectorApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        ensure_defaults()
+
+        self.title(f"{APP_NAME}  |  {COLLECTOR_VERSION}")
+        self.geometry("1280x790")
+        self.minsize(1000, 660)
+
+        self.devices = load_json(DEVICE_FILE, [])
+        self.credentials = load_json(CREDENTIAL_FILE, {})
+        if "default_profile" not in self.credentials and "general_profile" in self.credentials:
+            self.credentials["default_profile"] = self.credentials.pop("general_profile")
+            atomic_write_json(CREDENTIAL_FILE, self.credentials)
+        self.settings = load_json(SETTINGS_FILE, {})
+
+        settings_defaults = {
+            "default_device_type": "cisco_ios",
+            "output_directory": str(OUTPUT_DIR),
+            "read_only_protection": True,
+            "tcp_22_precheck": True,
+            "always_collect_running_config": True,
+            "command_timeout": 45,
+            "last_command_profile": DEFAULT_PROFILE_NAME,
+            "last_auth_preset": self.credentials.get("default_profile", "General"),
+            "last_collection_directory": "",
+            "storage_layout": clone_layout(DEFAULT_STORAGE_LAYOUT),
+            "storage_layout_name": "By Collection",
+            "storage_custom_presets": {},
+        }
+        changed = False
+        for key, value in settings_defaults.items():
+            if key not in self.settings:
+                self.settings[key] = value
+                changed = True
+        normalized_layout = normalize_storage_layout(self.settings.get("storage_layout", DEFAULT_STORAGE_LAYOUT))
+        if normalized_layout != self.settings.get("storage_layout"):
+            self.settings["storage_layout"] = normalized_layout
+            changed = True
+        normalized_custom = {
+            name: normalize_storage_layout(layout)
+            for name, layout in self.settings.get("storage_custom_presets", {}).items()
+        }
+        if normalized_custom != self.settings.get("storage_custom_presets", {}):
+            self.settings["storage_custom_presets"] = normalized_custom
+            changed = True
+        if changed:
+            atomic_write_json(SETTINGS_FILE, self.settings)
+
+        self.ui_queue = queue.Queue()
+        self.busy = False
+        self.one_off_commands = []
+        self._run_credentials = None
+        self._run_credential_source = ""
+        saved_last = self.settings.get("last_collection_directory", "")
+        self.last_collection_dir = Path(saved_last) if saved_last else None
+        self.always_collect_running_config_var = tk.BooleanVar(
+            value=bool(self.settings.get("always_collect_running_config", True))
+        )
+
+        self._build_style()
+        self._build_menu()
+        self._build_ui()
+        self.refresh_profile_list()
+        self.refresh_auth_presets()
+        self.refresh_device_tree()
+        self.update_action_states()
+        self._refresh_last_collection_menu()
+        self.after(100, self.process_ui_queue)
+
+    def _build_style(self):
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self.configure(bg="#f3f5f7")
+        base_bg = "#f3f5f7"
+        card_bg = "#ffffff"
+        text = "#1f2933"
+        muted = "#66727f"
+        border = "#d8dee5"
+        primary = "#2563eb"
+        primary_active = "#1d4ed8"
+
+        style.configure("TFrame", background=base_bg)
+        style.configure("Card.TFrame", background=card_bg)
+        style.configure("Toolbar.TFrame", background=card_bg)
+        style.configure("TLabel", background=base_bg, foreground=text, font=("Segoe UI", 9))
+        style.configure("Card.TLabel", background=card_bg, foreground=text, font=("Segoe UI", 9))
+        style.configure("Title.TLabel", background=base_bg, foreground=text, font=("Segoe UI Semibold", 18))
+        style.configure("Heading.TLabel", background=base_bg, foreground=text, font=("Segoe UI Semibold", 10))
+        style.configure("CardHeading.TLabel", background=card_bg, foreground=text, font=("Segoe UI Semibold", 10))
+        style.configure("Muted.TLabel", background=base_bg, foreground=muted, font=("Segoe UI", 9))
+        style.configure("CardMuted.TLabel", background=card_bg, foreground=muted, font=("Segoe UI", 9))
+
+        style.configure("TButton", font=("Segoe UI", 9), padding=(10, 6), borderwidth=1)
+        style.configure("Secondary.TButton", font=("Segoe UI Semibold", 9), padding=(12, 7))
+        style.map("Secondary.TButton", foreground=[("disabled", "#98a2ad")], background=[("disabled", "#e9edf1")])
+        style.configure("Run.TButton", font=("Segoe UI Semibold", 11), padding=(14, 11), foreground="#ffffff", background=primary, bordercolor=primary)
+        style.map(
+            "Run.TButton",
+            background=[("disabled", "#b8c1cc"), ("active", primary_active), ("pressed", primary_active)],
+            foreground=[("disabled", "#edf0f3"), ("!disabled", "#ffffff")],
+        )
+
+        style.configure("TCombobox", padding=5)
+        style.configure("TCheckbutton", background=card_bg, font=("Segoe UI", 9))
+        style.map("TCheckbutton", background=[("active", card_bg)])
+        style.configure("Treeview", rowheight=29, font=("Segoe UI", 9), background="#ffffff", fieldbackground="#ffffff", bordercolor=border, borderwidth=0)
+        style.configure("Treeview.Heading", font=("Segoe UI Semibold", 9), padding=(7, 7), background="#eef2f6", foreground=text, relief="flat")
+        style.map("Treeview", background=[("selected", "#dbeafe")], foreground=[("selected", text)])
+
+        style.configure("Neutral.Horizontal.TProgressbar", troughcolor="#e5e9ee", background="#64748b", bordercolor="#e5e9ee", lightcolor="#64748b", darkcolor="#64748b")
+        style.configure("Success.Horizontal.TProgressbar", troughcolor="#e5e9ee", background="#22a06b", bordercolor="#e5e9ee", lightcolor="#22a06b", darkcolor="#22a06b")
+        style.configure("Error.Horizontal.TProgressbar", troughcolor="#e5e9ee", background="#d14343", bordercolor="#e5e9ee", lightcolor="#d14343", darkcolor="#d14343")
+        style.configure("Warning.Horizontal.TProgressbar", troughcolor="#e5e9ee", background="#d99a2b", bordercolor="#e5e9ee", lightcolor="#d99a2b", darkcolor="#d99a2b")
+        style.configure("StatusNeutral.TLabel", background=card_bg, foreground="#475569", font=("Segoe UI Semibold", 9))
+        style.configure("StatusSuccess.TLabel", background=card_bg, foreground="#16805a", font=("Segoe UI Semibold", 9))
+        style.configure("StatusError.TLabel", background=card_bg, foreground="#c03636", font=("Segoe UI Semibold", 9))
+        style.configure("StatusWarning.TLabel", background=card_bg, foreground="#a56a12", font=("Segoe UI Semibold", 9))
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        import_menu = tk.Menu(file_menu, tearoff=0)
+        import_menu.add_command(label="JSON...", command=self.import_devices_json)
+        import_menu.add_command(label="Excel...", command=self.import_devices_excel)
+        file_menu.add_cascade(label="Import Devices", menu=import_menu)
+
+        export_menu = tk.Menu(file_menu, tearoff=0)
+        export_menu.add_command(label="JSON...", command=self.export_devices_json)
+        export_menu.add_command(label="Excel...", command=self.export_devices_excel)
+        file_menu.add_cascade(label="Export Devices", menu=export_menu)
+        file_menu.add_separator()
+        file_menu.add_command(label="Create Excel Device Template...", command=self.create_excel_template)
+        file_menu.add_separator()
+        file_menu.add_command(label="Open Last Collection", command=self.open_last_collection)
+        self.file_menu = file_menu
+        self.open_last_collection_menu_index = file_menu.index("end")
+        file_menu.add_command(label="Open Collections Folder", command=self.open_output_folder)
+        file_menu.add_command(label="Open Data Folder", command=lambda: self.open_path(APP_DIR))
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.destroy)
+        menubar.add_cascade(label="File", menu=file_menu)
+
+        profile_menu = tk.Menu(menubar, tearoff=0)
+        profile_menu.add_command(label="Open Selected TXT", command=self.open_selected_profile)
+        profile_menu.add_command(label="New TXT Profile...", command=self.new_profile)
+        profile_menu.add_command(label="Open Profiles Folder", command=lambda: self.open_path(PROFILE_DIR))
+        profile_menu.add_separator()
+        profile_menu.add_command(label="Refresh Profiles", command=self.refresh_profile_list)
+        menubar.add_cascade(label="Command Profiles", menu=profile_menu)
+
+        credential_menu = tk.Menu(menubar, tearoff=0)
+        credential_menu.add_command(label="Manage Saved Presets...", command=lambda: CredentialDialog(self))
+        menubar.add_cascade(label="Credentials", menu=credential_menu)
+
+        settings_menu = tk.Menu(menubar, tearoff=0)
+        settings_menu.add_checkbutton(
+            label="Always collect running config",
+            variable=self.always_collect_running_config_var,
+            command=self.on_always_collect_running_config_changed,
+        )
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Collection Storage...", command=lambda: StorageLayoutDialog(self))
+        menubar.add_cascade(label="Settings", menu=settings_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        self.config(menu=menubar)
+
+    def _build_ui(self):
+        header = ttk.Frame(self, padding=(18, 14, 18, 8))
+        header.pack(fill="x")
+        ttk.Label(header, text="Netmiko Universal Collector", style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Read-only SSH collection", style="Muted.TLabel").pack(side="left", padx=(12, 0), pady=(6, 0))
+
+        toolbar_outer = ttk.Frame(self, padding=(14, 0, 14, 8))
+        toolbar_outer.pack(fill="x")
+        toolbar = ttk.Frame(toolbar_outer, style="Toolbar.TFrame", padding=(12, 9))
+        toolbar.pack(fill="x")
+
+        ttk.Label(toolbar, text="Command Profile", style="CardHeading.TLabel").pack(side="left")
+        self.profile_var = tk.StringVar(value=self.settings.get("last_command_profile", DEFAULT_PROFILE_NAME))
+        self.profile_combo = ttk.Combobox(toolbar, textvariable=self.profile_var, state="readonly", width=25)
+        self.profile_combo.pack(side="left", padx=(7, 20))
+        self.profile_combo.bind("<<ComboboxSelected>>", self.on_profile_selected)
+
+        ttk.Label(toolbar, text="Authentication", style="CardHeading.TLabel").pack(side="left")
+        self.auth_var = tk.StringVar(value=self.settings.get("last_auth_preset", ""))
+        self.auth_combo = ttk.Combobox(toolbar, textvariable=self.auth_var, state="readonly", width=22)
+        self.auth_combo.pack(side="left", padx=(7, 12))
+        self.auth_combo.bind("<<ComboboxSelected>>", self.on_auth_selected)
+
+        self.use_token_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text="Use token / suffix", variable=self.use_token_var).pack(side="left")
+        self.one_off_button = ttk.Button(toolbar, text="One-off Commands", command=self.edit_one_off_commands)
+        self.one_off_button.pack(side="right")
+
+        hint_outer = ttk.Frame(self, padding=(18, 0, 18, 7))
+        hint_outer.pack(fill="x")
+        self.profile_hint_var = tk.StringVar()
+        ttk.Label(hint_outer, textvariable=self.profile_hint_var, style="Muted.TLabel").pack(side="left")
+
+        body = ttk.Panedwindow(self, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=14, pady=(0, 9))
+        left = ttk.Frame(body, padding=7, style="Card.TFrame")
+        right = ttk.Frame(body, padding=7, style="Card.TFrame")
+        body.add(left, weight=3)
+        body.add(right, weight=2)
+        self._build_devices_panel(left)
+        self._build_activity_panel(right)
+
+        actions_outer = ttk.Frame(self, padding=(14, 0, 14, 11))
+        actions_outer.pack(fill="x")
+        actions = ttk.Frame(actions_outer, padding=(7, 3))
+        actions.pack(fill="x")
+        secondary = ttk.Frame(actions)
+        secondary.pack(fill="x")
+        self.ping_button = ttk.Button(secondary, text="Ping", style="Secondary.TButton", command=self.ping_selected)
+        self.ping_button.pack(side="left", fill="x", expand=True)
+        self.ssh_button = ttk.Button(secondary, text="Test SSH", style="Secondary.TButton", command=self.test_ssh_selected)
+        self.ssh_button.pack(side="left", fill="x", expand=True, padx=(7, 0))
+        self.run_button = ttk.Button(actions, text="RUN COLLECTION", style="Run.TButton", command=self.run_collection)
+        self.run_button.pack(fill="x", pady=(7, 0))
+
+        status = ttk.Frame(self, padding=(14, 2, 14, 7))
+        status.pack(fill="x", side="bottom")
+        self.status_var = tk.StringVar(value="Ready")
+        ttk.Label(status, textvariable=self.status_var, style="Muted.TLabel").pack(side="left")
+        ttk.Label(status, text=f"Data: {APP_DIR}", style="Muted.TLabel").pack(side="right")
+
+    def _build_devices_panel(self, parent):
+        top = ttk.Frame(parent, style="Card.TFrame")
+        top.pack(fill="x", padx=3, pady=(2, 0))
+        ttk.Label(top, text="Devices", style="CardHeading.TLabel").pack(side="left")
+        self.selected_count_var = tk.StringVar(value="0 devices selected")
+        ttk.Label(top, textvariable=self.selected_count_var, style="CardMuted.TLabel").pack(side="left", padx=(10, 0))
+        ttk.Button(top, text="+ Device", command=self.add_device).pack(side="right")
+        ttk.Button(top, text="Edit", command=self.edit_device).pack(side="right", padx=4)
+        ttk.Button(top, text="Remove", command=self.remove_device).pack(side="right")
+
+        filters = ttk.Frame(parent, style="Card.TFrame")
+        filters.pack(fill="x", padx=3, pady=(8, 7))
+        self.device_search_var = tk.StringVar()
+        self.device_search_var.trace_add("write", lambda *_: self.refresh_device_tree())
+        ttk.Entry(filters, textvariable=self.device_search_var).pack(side="left", fill="x", expand=True)
+        self.location_var = tk.StringVar(value="All Locations")
+        self.location_combo = ttk.Combobox(filters, textvariable=self.location_var, state="readonly", width=20)
+        self.location_combo.pack(side="left", padx=(7, 0))
+        self.location_combo.bind("<<ComboboxSelected>>", lambda _e: self.refresh_device_tree())
+
+        columns = ("name", "ip", "location", "role", "device_type")
+        self.device_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="extended")
+        for col, title, width in [
+            ("name", "Name", 165),
+            ("ip", "IP Address", 125),
+            ("location", "Location", 140),
+            ("role", "Role", 105),
+            ("device_type", "Device Type", 115),
+        ]:
+            self.device_tree.heading(col, text=title)
+            self.device_tree.column(col, width=width, anchor="w")
+        self.device_tree.pack(fill="both", expand=True, padx=3, pady=(0, 3))
+        self.device_tree.bind("<Double-1>", lambda _e: self.edit_device())
+        self.device_tree.bind("<<TreeviewSelect>>", lambda _e: self.update_action_states())
+
+    def _build_activity_panel(self, parent):
+        top = ttk.Frame(parent, style="Card.TFrame")
+        top.pack(fill="x", padx=3, pady=(2, 0))
+        ttk.Label(top, text="Activity", style="CardHeading.TLabel").pack(side="left")
+        ttk.Button(top, text="Clear", command=lambda: self.activity.delete("1.0", "end")).pack(side="right")
+
+        self.operation_status_var = tk.StringVar(value="● Ready")
+        self.operation_status_label = ttk.Label(parent, textvariable=self.operation_status_var, style="StatusNeutral.TLabel")
+        self.operation_status_label.pack(fill="x", padx=3, pady=(9, 4))
+        self.progress = ttk.Progressbar(parent, mode="determinate", maximum=100, style="Neutral.Horizontal.TProgressbar")
+        self.progress.pack(fill="x", padx=3, pady=(0, 7))
+        self.activity = tk.Text(
+            parent,
+            wrap="none",
+            font=("Cascadia Mono", 9),
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground="#d8dee5",
+            background="#fbfcfd",
+            foreground="#26313c",
+            padx=8,
+            pady=8,
+        )
+        self.activity.pack(fill="both", expand=True, padx=3, pady=(0, 3))
+
+    def refresh_device_tree(self):
+        locations = sorted({
+            (d.get("location") or d.get("group") or "Unspecified").strip() or "Unspecified"
+            for d in self.devices
+        })
+        values = ["All Locations"] + locations
+        current = self.location_var.get() if hasattr(self, "location_var") else "All Locations"
+        self.location_combo.configure(values=values)
+        if current not in values:
+            self.location_var.set("All Locations")
+
+        for iid in self.device_tree.get_children():
+            self.device_tree.delete(iid)
+
+        search = self.device_search_var.get().strip().lower()
+        loc_filter = self.location_var.get()
+        for idx, dev in enumerate(self.devices):
+            location = (dev.get("location") or dev.get("group") or "Unspecified").strip() or "Unspecified"
+            hay = " ".join([
+                str(dev.get("name", "")),
+                str(dev.get("ip", "")),
+                location,
+                str(dev.get("role", "")),
+                str(dev.get("device_type", "")),
+                str(dev.get("notes", "")),
+            ]).lower()
+            if search and search not in hay:
+                continue
+            if loc_filter != "All Locations" and location != loc_filter:
+                continue
+            self.device_tree.insert(
+                "", "end", iid=str(idx),
+                values=(
+                    dev.get("name", ""),
+                    dev.get("ip", ""),
+                    location,
+                    dev.get("role", ""),
+                    dev.get("device_type", "cisco_ios"),
+                ),
+            )
+        if hasattr(self, "selected_count_var"):
+            self.update_action_states()
+
+    def refresh_profile_list(self):
+        ensure_defaults()
+        names = [p.stem for p in profile_files()]
+        self.profile_combo.configure(values=names)
+        preferred = self.profile_var.get() or self.settings.get("last_command_profile", "")
+        if preferred not in names:
+            preferred = self.settings.get("last_command_profile", "")
+        if preferred not in names:
+            preferred = DEFAULT_PROFILE_NAME if DEFAULT_PROFILE_NAME in names else (names[0] if names else "")
+        self.profile_var.set(preferred)
+        self.update_profile_hint()
+
+    def update_profile_hint(self):
+        name = self.profile_var.get()
+        path = PROFILE_DIR / f"{name}.txt"
+        if not path.exists():
+            self.profile_hint_var.set("No command profile selected.")
+            return
+        commands, meta = load_profile(path)
+        desc = meta.get("description", "")
+        has_run_cfg = any(is_full_running_config_command(cmd) for cmd in commands)
+        if has_run_cfg:
+            cfg_note = "CFG backup: profile includes running-config"
+        elif self.always_collect_running_config_var.get():
+            cfg_note = "CFG backup: running-config auto-added"
+        else:
+            cfg_note = "CFG backup: only if profile includes running-config"
+        hint = f"{len(commands)} command(s)  •  {cfg_note}"
+        if desc:
+            hint += f"  •  {desc}"
+        self.profile_hint_var.set(hint)
+
+    def refresh_auth_presets(self):
+        names = sorted(self.credentials.get("presets", {}).keys(), key=str.lower)
+        values = names + ["Manual Input"]
+        self.auth_combo.configure(values=values)
+        preferred = self.auth_var.get() or self.settings.get("last_auth_preset", "")
+        if preferred not in values:
+            preferred = self.settings.get("last_auth_preset", "")
+        if preferred not in values:
+            default = self.credentials.get("default_profile", "")
+            preferred = default if default in names else (names[0] if names else "Manual Input")
+        self.auth_var.set(preferred)
+
+    def on_profile_selected(self, _event=None):
+        self.update_profile_hint()
+        self.settings["last_command_profile"] = self.profile_var.get()
+        atomic_write_json(SETTINGS_FILE, self.settings)
+
+    def on_auth_selected(self, _event=None):
+        self.settings["last_auth_preset"] = self.auth_var.get()
+        atomic_write_json(SETTINGS_FILE, self.settings)
+
+    def on_always_collect_running_config_changed(self):
+        enabled = bool(self.always_collect_running_config_var.get())
+        self.settings["always_collect_running_config"] = enabled
+        atomic_write_json(SETTINGS_FILE, self.settings)
+        self.update_profile_hint()
+        state = "enabled" if enabled else "disabled"
+        self.log_ui(f"[SETTINGS] Automatic running-config collection {state}.")
+
+    def update_action_states(self):
+        if not hasattr(self, "device_tree"):
+            return
+        count = len(self.device_tree.selection())
+        if hasattr(self, "selected_count_var"):
+            self.selected_count_var.set(f"{count} device{'s' if count != 1 else ''} selected")
+        state = "disabled" if self.busy or count == 0 else "normal"
+        for button_name in ("ping_button", "ssh_button", "run_button"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.configure(state=state)
+
+    def set_operation_visual(self, state, text):
+        style_map = {
+            "neutral": ("Neutral.Horizontal.TProgressbar", "StatusNeutral.TLabel"),
+            "success": ("Success.Horizontal.TProgressbar", "StatusSuccess.TLabel"),
+            "error": ("Error.Horizontal.TProgressbar", "StatusError.TLabel"),
+            "warning": ("Warning.Horizontal.TProgressbar", "StatusWarning.TLabel"),
+        }
+        progress_style, label_style = style_map.get(state, style_map["neutral"])
+        self.progress.configure(style=progress_style)
+        self.operation_status_label.configure(style=label_style)
+        self.operation_status_var.set("● " + text)
+
+    def _refresh_last_collection_menu(self):
+        if not hasattr(self, "file_menu"):
+            return
+        enabled = bool(self.last_collection_dir and Path(self.last_collection_dir).exists())
+        self.file_menu.entryconfigure(self.open_last_collection_menu_index, state="normal" if enabled else "disabled")
+
+    def selected_devices(self):
+        result = []
+        for iid in self.device_tree.selection():
+            idx = int(iid)
+            if 0 <= idx < len(self.devices):
+                result.append(self.devices[idx])
+        return result
+
+    def add_device(self):
+        DeviceDialog(self, "Add Device", on_save=self._add_device_callback)
+
+    def _add_device_callback(self, data):
+        self.devices.append(data)
+        atomic_write_json(DEVICE_FILE, self.devices)
+        self.refresh_device_tree()
+
+    def edit_device(self):
+        selected = self.device_tree.selection()
+        if not selected:
+            messagebox.showwarning("Select device", "Select a device to edit.")
+            return
+        idx = int(selected[0])
+        DeviceDialog(
+            self,
+            "Edit Device",
+            initial=self.devices[idx],
+            on_save=lambda data: self._edit_device_callback(idx, data),
+        )
+
+    def _edit_device_callback(self, idx, data):
+        self.devices[idx] = data
+        atomic_write_json(DEVICE_FILE, self.devices)
+        self.refresh_device_tree()
+
+    def remove_device(self):
+        selected = list(self.device_tree.selection())
+        if not selected:
+            return
+        if not messagebox.askyesno("Remove devices", f"Remove {len(selected)} selected device(s)?"):
+            return
+        for idx in sorted((int(i) for i in selected), reverse=True):
+            self.devices.pop(idx)
+        atomic_write_json(DEVICE_FILE, self.devices)
+        self.refresh_device_tree()
+
+    # -------------------- JSON / Excel device library --------------------
+
+    def import_devices_json(self):
+        path = filedialog.askopenfilename(
+            title="Import Device Library - JSON",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            incoming = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+            if isinstance(incoming, dict) and "devices" in incoming:
+                incoming = incoming["devices"]
+            if not isinstance(incoming, list):
+                raise ValueError("Device JSON must contain a list or {'devices': [...]}.")
+            self.devices = self._sanitize_devices(incoming)
+            atomic_write_json(DEVICE_FILE, self.devices)
+            self.refresh_device_tree()
+            self.log_ui(f"[LIBRARY] Imported {len(self.devices)} devices from JSON.")
+        except Exception as exc:
+            messagebox.showerror("Import failed", str(exc))
+
+    def export_devices_json(self):
+        path = filedialog.asksaveasfilename(
+            title="Export Device Library - JSON",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+            initialfile="netmiko_devices_shared.json",
+        )
+        if not path:
+            return
+        sanitized = self._sanitize_devices(self.devices)
+        Path(path).write_text(json.dumps(sanitized, indent=2), encoding="utf-8")
+        self.log_ui(f"[LIBRARY] Exported {len(sanitized)} devices to JSON.")
+
+    def import_devices_excel(self):
+        if not require_openpyxl(self):
+            return
+        path = filedialog.askopenfilename(
+            title="Import Device Library - Excel",
+            filetypes=[("Excel workbooks", "*.xlsx"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            incoming = read_device_workbook(Path(path))
+            if not incoming:
+                raise ValueError("No valid device rows were found in the workbook.")
+            self.devices = self._sanitize_devices(incoming)
+            atomic_write_json(DEVICE_FILE, self.devices)
+            self.refresh_device_tree()
+            self.log_ui(f"[LIBRARY] Imported {len(self.devices)} devices from Excel.")
+        except Exception as exc:
+            messagebox.showerror("Excel import failed", str(exc))
+
+    def export_devices_excel(self):
+        if not require_openpyxl(self):
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export Device Library - Excel",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbooks", "*.xlsx")],
+            initialfile="Netmiko_Device_Library.xlsx",
+        )
+        if not path:
+            return
+        try:
+            write_device_workbook(Path(path), devices=self._sanitize_devices(self.devices))
+            self.log_ui(f"[LIBRARY] Exported {len(self.devices)} devices to Excel.")
+        except Exception as exc:
+            messagebox.showerror("Excel export failed", str(exc))
+
+    def create_excel_template(self):
+        if not require_openpyxl(self):
+            return
+        path = filedialog.asksaveasfilename(
+            title="Create Excel Device Template",
+            defaultextension=".xlsx",
+            filetypes=[("Excel workbooks", "*.xlsx")],
+            initialfile="Netmiko_Device_Import_Template.xlsx",
+        )
+        if not path:
+            return
+        try:
+            write_device_workbook(Path(path), template=True)
+            messagebox.showinfo("Template created", f"Device template created:\n\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Template failed", str(exc))
+
+    @staticmethod
+    def _sanitize_devices(devices):
+        clean = []
+        for dev in devices:
+            name = str(dev.get("name", dev.get("alias", "")) or "").strip()
+            ip = str(dev.get("ip", dev.get("host", "")) or "").strip()
+            if not name or not ip:
+                continue
+            clean.append({
+                "name": name,
+                "ip": ip,
+                "location": str(dev.get("location", dev.get("group", "")) or "").strip(),
+                "role": str(dev.get("role", "") or "").strip(),
+                "device_type": str(dev.get("device_type", "cisco_ios") or "cisco_ios").strip(),
+                "notes": str(dev.get("notes", "") or "").strip(),
+            })
+        return clean
+
+    # -------------------- Command profiles / one-off commands --------------------
+
+    def new_profile(self):
+        name = simpledialog.askstring("New command profile", "Profile name:", parent=self)
+        if not name:
+            return
+        name = re.sub(r'[<>:"/\\|?*]+', "_", name.strip())
+        if not name:
+            return
+        path = PROFILE_DIR / f"{name}.txt"
+        if path.exists():
+            messagebox.showwarning("Profile exists", f"{path.name} already exists.")
+            return
+        path.write_text(
+            "# One command per line. Blank lines and # comments are ignored.\n\nshow clock\nshow version\n",
+            encoding="utf-8",
+        )
+        self.refresh_profile_list()
+        self.profile_var.set(name)
+        self.update_profile_hint()
+        self.open_path(path)
+
+    def open_selected_profile(self):
+        path = PROFILE_DIR / f"{self.profile_var.get()}.txt"
+        if path.exists():
+            self.open_path(path)
+
+    def edit_one_off_commands(self):
+        dialog = CommandsDialog(self, self.one_off_commands)
+        if dialog.result is not None:
+            self.one_off_commands = dialog.result
+            count = len(self.one_off_commands)
+            self.one_off_button.configure(text=f"One-off Commands ({count})" if count else "One-off Commands")
+
+    def current_commands(self):
+        path = PROFILE_DIR / f"{self.profile_var.get()}.txt"
+        if not path.exists():
+            raise FileNotFoundError(f"Command profile not found: {path}")
+        profile_commands, metadata = load_profile(path)
+        one_off = list(self.one_off_commands)
+        all_commands = profile_commands + one_off
+
+        # Config-backup policy is collector-level rather than profile-level. A profile may
+        # explicitly request any recognized full running-config command. If it does not,
+        # the persistent setting can append one canonical command for this run only.
+        automatically_added_commands = []
+        has_full_running_config = any(is_full_running_config_command(cmd) for cmd in all_commands)
+        if self.settings.get("always_collect_running_config", True) and not has_full_running_config:
+            automatic_command = "show running-config"
+            all_commands.append(automatic_command)
+            automatically_added_commands.append(automatic_command)
+
+        if self.settings.get("read_only_protection", True):
+            blocked = [cmd for cmd in all_commands if not is_read_only(cmd)]
+            if blocked:
+                raise ValueError(
+                    "Read-only protection blocked:\n\n" + "\n".join(blocked) +
+                    "\n\nAlpha permits SHOW, DIR, PING, and TRACEROUTE commands only."
+                )
+        profile_info = {
+            "name": self.profile_var.get(),
+            "source_file": path.name,
+            "profile_file_sha256": sha256_file(path),
+            "command_set_sha256": command_set_sha256(all_commands),
+            "profile_command_count": len(profile_commands),
+            "one_off_command_count": len(one_off),
+            "automatically_added_command_count": len(automatically_added_commands),
+            "automatically_added_commands": automatically_added_commands,
+            "running_config_backup_policy": (
+                "automatic" if self.settings.get("always_collect_running_config", True) else "profile_only"
+            ),
+            "total_command_count": len(all_commands),
+            "metadata": metadata,
+        }
+        return all_commands, metadata, profile_info
+
+    # -------------------- Run-time authentication --------------------
+
+    def prepare_run_credentials(self):
+        selected = self.auth_var.get()
+        use_token = self.use_token_var.get()
+        presets = self.credentials.get("presets", {})
+
+        if selected == "Manual Input":
+            dialog = CredentialPrompt(self, manual=True, use_token=use_token)
+            if not dialog.result:
+                return False
+            self._run_credentials = dialog.result
+            self._run_credential_source = "Manual Input"
+            return True
+
+        preset = presets.get(selected)
+        if not preset:
+            messagebox.showwarning("Authentication", "Select a saved credential preset or Manual Input.")
+            return False
+        if not preset.get("username") or not preset.get("password_base"):
+            messagebox.showwarning(
+                "Authentication",
+                f"Credential preset '{selected}' is incomplete.\n\nUse Credentials > Manage Saved Presets to configure it.",
+            )
+            return False
+
+        if use_token:
+            dialog = CredentialPrompt(self, preset_name=selected, preset=preset, manual=False, use_token=True)
+            if not dialog.result:
+                return False
+            self._run_credentials = dialog.result
+        else:
+            self._run_credentials = {
+                "username": preset.get("username", "").strip(),
+                "password": preset.get("password_base", ""),
+                "token_used": False,
+            }
+        self._run_credential_source = f"Saved Preset: {selected}"
+        return True
+
+    def clear_run_credentials(self):
+        self._run_credentials = None
+        self._run_credential_source = ""
+
+    # -------------------- Actions --------------------
+
+    def ping_selected(self):
+        devices = self.selected_devices()
+        if not devices:
+            return
+        self.start_worker(
+            self._ping_worker,
+            devices,
+            operation_label=f"Pinging {len(devices)} device{'s' if len(devices) != 1 else ''}...",
+        )
+
+    def _ping_worker(self, devices):
+        self.qlog(f"\n{'='*70}\nPING TEST\n{'='*70}")
+        passed = 0
+        for i, dev in enumerate(devices, 1):
+            ok, elapsed, output = ping_host(dev.get("ip", ""))
+            if ok:
+                passed += 1
+            self.qlog(f"[{'PASS' if ok else 'FAIL'}] {dev.get('name')} ({dev.get('ip')}) - {elapsed:.2f}s")
+            if not ok and output:
+                tail = output.splitlines()[-1] if output.splitlines() else output
+                self.qlog(f"       {tail}")
+            self.qprogress(i / len(devices) * 100)
+        state = "success" if passed == len(devices) else ("error" if passed == 0 else "warning")
+        return {"state": state, "status": f"Ping Complete — {passed}/{len(devices)} responded"}
+
+    def test_ssh_selected(self):
+        devices = self.selected_devices()
+        if not devices:
+            return
+        if not self.prepare_run_credentials():
+            return
+        self.start_worker(
+            self._test_ssh_worker,
+            devices,
+            operation_label=f"Testing SSH on {len(devices)} device{'s' if len(devices) != 1 else ''}...",
+        )
+
+    def _test_ssh_worker(self, devices):
+        self.qlog(f"\n{'='*70}\nSSH CONNECTION TEST\n{'='*70}")
+        passed = 0
+        for i, dev in enumerate(devices, 1):
+            conn = None
+            try:
+                if self.settings.get("tcp_22_precheck", True):
+                    open22, _elapsed, reason = tcp_22_test(dev["ip"])
+                    if not open22:
+                        self.qlog(f"[FAIL] {dev.get('name')} ({dev['ip']}) TCP/22 unreachable: {reason}")
+                        continue
+                conn, info = self.connect_device(dev)
+                passed += 1
+                self.qlog(f"[PASS] {dev.get('name')} ({dev['ip']}) prompt={info['prompt']} auth={info['credential_source']}")
+            except Exception as exc:
+                self.qlog(f"[FAIL] {dev.get('name')} ({dev.get('ip')}) - {self.clean_exception(exc)}")
+            finally:
+                if conn:
+                    try:
+                        conn.disconnect()
+                    except Exception:
+                        pass
+                self.qprogress(i / len(devices) * 100)
+        state = "success" if passed == len(devices) else ("error" if passed == 0 else "warning")
+        return {"state": state, "status": f"SSH Test Complete — {passed}/{len(devices)} connected"}
+
+    def run_collection(self):
+        devices = self.selected_devices()
+        if not devices:
+            return
+        try:
+            commands, metadata, profile_info = self.current_commands()
+        except Exception as exc:
+            messagebox.showerror("Command profile", str(exc))
+            return
+        if not commands:
+            messagebox.showwarning("No commands", "The selected command profile contains no commands.")
+            return
+        if not self.prepare_run_credentials():
+            return
+
+        now = datetime.now().astimezone()
+        batch_id = now.strftime("%Y%m%d_%H%M%S")
+        profile_name = self.profile_var.get()
+        configured = Path(self.settings.get("output_directory", str(OUTPUT_DIR))).expanduser()
+        storage_layout = normalize_storage_layout(self.settings.get("storage_layout", DEFAULT_STORAGE_LAYOUT))
+        context = {
+            "collection_id": batch_id,
+            "profile": profile_name,
+            "safe_profile": safe_filename(profile_name),
+            "profile_info": profile_info,
+            "started": now.isoformat(timespec="milliseconds"),
+            "run_datetime": now,
+            "storage_base": configured,
+            "storage_layout": storage_layout,
+            "storage_layout_name": self.settings.get("storage_layout_name", "Custom"),
+        }
+        self.start_worker(
+            self._collection_worker,
+            devices,
+            commands,
+            metadata,
+            context,
+            operation_label=f"Collecting {len(devices)} device{'s' if len(devices) != 1 else ''}...",
+        )
+
+    def connect_device(self, device):
+        if ConnectHandler is None:
+            raise RuntimeError("Netmiko is not installed. Run: pip install netmiko")
+        if not self._run_credentials:
+            raise RuntimeError("Run credentials were not prepared.")
+
+        params = {
+            "device_type": device.get("device_type", self.settings.get("default_device_type", "cisco_ios")) or "cisco_ios",
+            "host": device["ip"],
+            "username": self._run_credentials["username"],
+            "password": self._run_credentials["password"],
+            "fast_cli": False,
+        }
+        conn = ConnectHandler(**params)
+        try:
+            prompt = conn.find_prompt().strip()
+        except Exception:
+            prompt = ""
+        return conn, {
+            "prompt": prompt,
+            "credential_source": self._run_credential_source,
+            "username": self._run_credentials["username"],
+            "device_type": params["device_type"],
+            "token_used": bool(self._run_credentials.get("token_used")),
+        }
+
+    def _collection_worker(self, devices, commands, profile_metadata, context):
+        self.qlog(f"\n{'='*78}\nCOLLECTION\n{'='*78}")
+        self.qlog(f"Collection ID: {context['collection_id']} | Profile: {context['profile']} | Devices: {len(devices)} | Commands/device: {len(commands)}")
+        context["storage_base"].mkdir(parents=True, exist_ok=True)
+        results = []
+        for i, dev in enumerate(devices, 1):
+            results.append(self.collect_device(dev, commands, profile_metadata, context))
+            self.qprogress(i / len(devices) * 100)
+
+        connected = sum(1 for r in results if r.get("connection", {}).get("success"))
+        successful = sum(1 for r in results if self.device_result_status(r) == "SUCCESS")
+        partial = sum(1 for r in results if self.device_result_status(r) == "PARTIAL")
+        failed = len(results) - connected
+        summary_log, summary_json = self.save_batch_summary(results, context)
+        self.qlog(f"\n{'-'*78}")
+        self.qlog(f"Batch complete: {successful} successful | {partial} partial | {failed} connection failed")
+        self.qlog(f"Summary LOG : {summary_log}")
+        self.qlog(f"Manifest JSON: {summary_json}")
+        self.qlog(f"{'-'*78}")
+
+        artifact_paths = [summary_log, summary_json]
+        for result in results:
+            saved = result.get("_saved_files", {})
+            artifact_paths.extend([saved.get("log"), saved.get("json"), saved.get("running_config")])
+        collection_anchor = common_artifact_directory(artifact_paths, context["storage_base"])
+
+        state = "success" if successful == len(results) else ("error" if connected == 0 else "warning")
+        return {
+            "state": state,
+            "status": f"Collection Complete — {successful} successful, {partial} partial, {failed} failed",
+            "last_collection_dir": str(collection_anchor),
+        }
+
+    def collect_device(self, device, commands, profile_metadata, context):
+        started_dt = datetime.now().astimezone()
+        started_perf = time.perf_counter()
+        conn = None
+        connection = {
+            "status": "connection_error",
+            "success": False,
+            "error_type": "",
+            "error": "",
+            "credential_source": self._run_credential_source,
+            "username": self._run_credentials["username"] if self._run_credentials else "",
+            "token_used": bool(self._run_credentials and self._run_credentials.get("token_used")),
+            "netmiko_device_type": device.get("device_type", self.settings.get("default_device_type", "cisco_ios")) or "cisco_ios",
+            "detected_prompt": "",
+            "tcp_22_precheck": {
+                "enabled": bool(self.settings.get("tcp_22_precheck", True)),
+                "status": "not_run",
+                "duration_seconds": None,
+                "error": "",
+            },
+        }
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "schema_name": SCHEMA_NAME,
+            "document_type": "device_collection",
+            "collector": {
+                "name": APP_NAME,
+                "version": COLLECTOR_VERSION,
+            },
+            "collection": {
+                "mode": "full",
+                "collection_id": context["collection_id"],
+                "batch_started": context["started"],
+                "started": started_dt.isoformat(timespec="milliseconds"),
+                "finished": None,
+                "duration_seconds": None,
+                "profile": context["profile_info"],
+            },
+            "device": {
+                "name": device.get("name", ""),
+                "ip": device.get("ip", ""),
+                "location": device.get("location", device.get("group", "")),
+                "role": device.get("role", ""),
+                "notes": device.get("notes", ""),
+                "configured_device_type": device.get("device_type", "cisco_ios"),
+            },
+            "connection": connection,
+            "commands": [],
+            "artifacts": {
+                "running_config": {
+                    "available": False,
+                    "filename": None,
+                    "source_command_sequence": None,
+                    "source_command": None,
+                    "sha256": None,
+                    "bytes": 0,
+                    "format": "text/plain; cisco-running-config",
+                }
+            },
+            "summary": {
+                "overall_status": "connection_failed",
+                "commands_planned": len(commands),
+                "commands_attempted": 0,
+                "commands_successful": 0,
+                "commands_failed": 0,
+            },
+        }
+
+        name = device.get("name") or device.get("ip")
+        ip = device.get("ip")
+        self.qlog(f"\n>>> {name} ({ip})")
+
+        try:
+            if connection["tcp_22_precheck"]["enabled"]:
+                open22, elapsed, reason = tcp_22_test(ip)
+                connection["tcp_22_precheck"]["duration_seconds"] = round(elapsed, 3)
+                if not open22:
+                    connection["tcp_22_precheck"]["status"] = "failed"
+                    connection["tcp_22_precheck"]["error"] = reason
+                    connection["status"] = "tcp_22_unreachable"
+                    connection["error_type"] = "ConnectionError"
+                    connection["error"] = f"TCP/22 unreachable after {elapsed:.2f}s: {reason}"
+                    raise ConnectionError(connection["error"])
+                connection["tcp_22_precheck"]["status"] = "success"
+                self.qlog(f"    [PASS] TCP/22 reachable ({elapsed:.2f}s)")
+
+            conn, info = self.connect_device(device)
+            connection["status"] = "success"
+            connection["success"] = True
+            connection["detected_prompt"] = info["prompt"]
+            connection["netmiko_device_type"] = info["device_type"]
+            self.qlog(f"    [PASS] SSH connected | prompt={info['prompt'] or '(unknown)'} | auth={info['credential_source']}")
+
+            # Terminal setup is intentionally outside the requested command set and is not
+            # written into command output. Failure here never aborts a collection.
+            try:
+                conn.send_command_timing("terminal length 0", strip_prompt=True, strip_command=True)
+            except Exception:
+                pass
+            try:
+                conn.send_command_timing("terminal width 511", strip_prompt=True, strip_command=True)
+            except Exception:
+                pass
+
+            read_timeout = profile_metadata.get("read_timeout", self.settings.get("command_timeout", 45))
+            for number, cmd in enumerate(commands, 1):
+                cmd_started_dt = datetime.now().astimezone()
+                cmd_started_perf = time.perf_counter()
+                entry = {
+                    "sequence": number,
+                    "command": cmd,
+                    "status": "execution_error",
+                    "success": False,
+                    "started": cmd_started_dt.isoformat(timespec="milliseconds"),
+                    "finished": None,
+                    "duration_seconds": None,
+                    "output": "",
+                    "error": "",
+                }
+                self.qlog(f"    [{number:02d}/{len(commands):02d}] {cmd}")
+                try:
+                    # OUTPUT CONTRACT: Never parse, sort, normalize, or reinterpret this string.
+                    # Prompt and command echo are stripped deliberately so commands[].output is
+                    # the reusable response body for downstream scripts.
+                    output = conn.send_command(
+                        cmd,
+                        strip_prompt=True,
+                        strip_command=True,
+                        read_timeout=float(read_timeout),
+                    )
+                    entry["output"] = output
+                    if cli_output_indicates_error(output):
+                        entry["status"] = "cli_error"
+                        entry["error"] = "Device returned a CLI command error."
+                        self.qlog("         [FAIL] CLI command error; continuing.")
+                    else:
+                        entry["status"] = "success"
+                        entry["success"] = True
+                        self.qlog("         [PASS]")
+                except Exception as exc:
+                    entry["status"] = classify_command_exception(exc)
+                    entry["error"] = self.clean_exception(exc)
+                    self.qlog(f"         [FAIL] {entry['error']} | continuing.")
+                finally:
+                    entry["finished"] = local_timestamp()
+                    entry["duration_seconds"] = round(time.perf_counter() - cmd_started_perf, 3)
+                    result["commands"].append(entry)
+
+        except NetmikoAuthenticationException as exc:
+            connection["status"] = "authentication_failed"
+            connection["error_type"] = exc.__class__.__name__
+            connection["error"] = f"Authentication failed: {self.clean_exception(exc)}"
+            self.qlog(f"    [FAIL] {connection['error']}")
+        except NetmikoTimeoutException as exc:
+            connection["status"] = "timeout"
+            connection["error_type"] = exc.__class__.__name__
+            connection["error"] = f"SSH timed out: {self.clean_exception(exc)}"
+            self.qlog(f"    [FAIL] {connection['error']}")
+        except Exception as exc:
+            # Preserve a more specific status already set by the TCP/22 precheck.
+            if connection["status"] == "connection_error":
+                connection["error_type"] = exc.__class__.__name__
+                connection["error"] = self.clean_exception(exc)
+            self.qlog(f"    [FAIL] {connection['error'] or self.clean_exception(exc)}")
+        finally:
+            if conn:
+                try:
+                    conn.disconnect()
+                except Exception:
+                    pass
+
+            result["collection"]["finished"] = local_timestamp()
+            result["collection"]["duration_seconds"] = round(time.perf_counter() - started_perf, 3)
+            attempted = len(result["commands"])
+            succeeded = sum(1 for x in result["commands"] if x.get("status") == "success")
+            failed = attempted - succeeded
+            if not connection["success"]:
+                overall = "connection_failed"
+            elif failed:
+                overall = "partial"
+            else:
+                overall = "success"
+            result["summary"] = {
+                "overall_status": overall,
+                "commands_planned": len(commands),
+                "commands_attempted": attempted,
+                "commands_successful": succeeded,
+                "commands_failed": failed,
+            }
+
+            try:
+                log_path, json_path, cfg_path = self.save_result(result, context)
+                result["_saved_files"] = {"log": log_path, "json": json_path, "running_config": cfg_path}
+                self.qlog(f"    Saved LOG : {log_path}")
+                self.qlog(f"    Saved JSON: {json_path}")
+                if cfg_path:
+                    self.qlog(f"    Saved CFG : {cfg_path}")
+            except Exception as exc:
+                self.qlog(f"    [FAIL] Could not save output: {self.clean_exception(exc)}")
+        return result
+
+    def save_result(self, result, context):
+        device_name = safe_filename(result["device"].get("name") or result["device"].get("ip"))
+        device_values = storage_token_values(
+            context.get("run_datetime", datetime.now().astimezone()),
+            context.get("profile", ""),
+            context.get("collection_id", ""),
+            result.get("device", {}),
+        )
+        storage_layout = normalize_storage_layout(context.get("storage_layout", DEFAULT_STORAGE_LAYOUT))
+        levels = storage_layout.get("levels", [])
+        device_depth = storage_layout.get("destinations", {}).get("device_files", len(levels))
+        device_dir = build_storage_path_to_depth(
+            context["storage_base"], levels, device_depth, device_values
+        )
+        device_dir.mkdir(parents=True, exist_ok=True)
+
+        base = f"{device_name}_{context['safe_profile']}_{context['collection_id']}"
+        log_path = device_dir / f"{base}.log"
+        json_path = device_dir / f"{base}.json"
+
+        cfg_path = None
+        cfg_entry = find_running_config_entry(result)
+        if cfg_entry is not None:
+            cfg_text = build_running_config_cfg(cfg_entry.get("output", ""))
+            if cfg_text.strip():
+                cfg_path = device_dir / f"{device_name}_running-config_{context['collection_id']}.cfg"
+                cfg_path.write_text(cfg_text, encoding="utf-8")
+                cfg_bytes = cfg_text.encode("utf-8")
+                result["artifacts"]["running_config"] = {
+                    "available": True,
+                    "filename": cfg_path.name,
+                    "source_command_sequence": cfg_entry.get("sequence"),
+                    "source_command": cfg_entry.get("command"),
+                    "sha256": sha256_bytes(cfg_bytes),
+                    "bytes": len(cfg_bytes),
+                    "format": "text/plain; cisco-running-config",
+                }
+
+        # Device JSON remains the canonical machine-readable record. LOG and CFG are
+        # sibling human/recovery artifacts by design.
+        atomic_write_json(json_path, result)
+        log_path.write_text(self.render_universal_log(result), encoding="utf-8")
+        return log_path, json_path, cfg_path
+
+    @staticmethod
+    def device_result_status(result):
+        status = result.get("summary", {}).get("overall_status", "connection_failed")
+        return {
+            "success": "SUCCESS",
+            "partial": "PARTIAL",
+            "connection_failed": "SSH FAILED",
+        }.get(status, "PARTIAL")
+
+    def save_batch_summary(self, results, context):
+        storage_layout = normalize_storage_layout(context.get("storage_layout", DEFAULT_STORAGE_LAYOUT))
+        levels = storage_layout.get("levels", [])
+        destinations = storage_layout.get("destinations", {})
+        collection_values = storage_token_values(
+            context.get("run_datetime", datetime.now().astimezone()),
+            context.get("profile", ""),
+            context.get("collection_id", ""),
+            {},
+        )
+
+        manifest_dir = build_storage_path_to_depth(
+            context["storage_base"], levels, destinations.get("manifest", 0), collection_values
+        )
+        summary_dir = build_storage_path_to_depth(
+            context["storage_base"], levels, destinations.get("summary", 0), collection_values
+        )
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        summary_dir.mkdir(parents=True, exist_ok=True)
+
+        summary_base = f"Collection_Summary_{context['safe_profile']}_{context['collection_id']}"
+        manifest_base = f"Collection_Manifest_{context['safe_profile']}_{context['collection_id']}"
+        json_path = manifest_dir / f"{manifest_base}.json"
+        log_path = summary_dir / f"{summary_base}.log"
+
+        def manifest_relative(path):
+            if not path:
+                return ""
+            try:
+                return os.path.relpath(str(Path(path)), start=str(manifest_dir))
+            except Exception:
+                return str(path)
+
+        rows = []
+        for result in results:
+            saved = result.get("_saved_files", {})
+            summary = result.get("summary", {})
+            connection = result.get("connection", {})
+            rows.append({
+                "name": result.get("device", {}).get("name", ""),
+                "ip": result.get("device", {}).get("ip", ""),
+                "location": result.get("device", {}).get("location", ""),
+                "status": summary.get("overall_status", "connection_failed"),
+                "connection_status": connection.get("status", "connection_error"),
+                "commands_planned": summary.get("commands_planned", 0),
+                "commands_attempted": summary.get("commands_attempted", 0),
+                "commands_successful": summary.get("commands_successful", 0),
+                "commands_failed": summary.get("commands_failed", 0),
+                "connection_error": connection.get("error", ""),
+                "files": {
+                    "log": manifest_relative(saved.get("log")),
+                    "json": manifest_relative(saved.get("json")),
+                    "running_config": manifest_relative(saved.get("running_config")) or None,
+                },
+            })
+
+        successful = sum(1 for row in rows if row["status"] == "success")
+        partial = sum(1 for row in rows if row["status"] == "partial")
+        failed = sum(1 for row in rows if row["status"] == "connection_failed")
+        finished = datetime.now().astimezone()
+        try:
+            started_dt = datetime.fromisoformat(context["started"])
+            batch_duration = round((finished - started_dt).total_seconds(), 3)
+        except Exception:
+            batch_duration = None
+
+        manifest = {
+            "schema_version": SCHEMA_VERSION,
+            "schema_name": SCHEMA_NAME,
+            "document_type": "collection_manifest",
+            "collector": {
+                "name": APP_NAME,
+                "version": COLLECTOR_VERSION,
+            },
+            "collection": {
+                "collection_id": context["collection_id"],
+                "started": context["started"],
+                "finished": finished.isoformat(timespec="milliseconds"),
+                "duration_seconds": batch_duration,
+                "profile": context["profile_info"],
+                "storage": {
+                    "layout_name": context.get("storage_layout_name", "Custom"),
+                    "relative_path_base": "manifest_directory",
+                },
+            },
+            "artifacts": {
+                "summary_log": manifest_relative(log_path),
+            },
+            "summary": {
+                "devices_selected": len(rows),
+                "connected": len(rows) - failed,
+                "successful": successful,
+                "partial": partial,
+                "connection_failed": failed,
+            },
+            "devices": rows,
+        }
+
+        atomic_write_json(json_path, manifest)
+        log_path.write_text(self.render_batch_summary(manifest), encoding="utf-8")
+        return log_path, json_path
+
+    @staticmethod
+    def render_batch_summary(manifest):
+        c = manifest.get("collection", {})
+        profile = c.get("profile", {})
+        summary = manifest.get("summary", {})
+        lines = [
+            "=" * 102,
+            "NETMIKO UNIVERSAL COLLECTOR - BATCH SUMMARY / MANIFEST",
+            "=" * 102,
+            f"Schema            : {manifest.get('schema_name')} v{manifest.get('schema_version')} ({SCHEMA_STATUS})",
+            f"Collector Version : {manifest.get('collector', {}).get('version')}",
+            f"Collection ID     : {c.get('collection_id')}",
+            f"Command Profile   : {profile.get('name')}",
+            f"Profile SHA-256   : {profile.get('profile_file_sha256')}",
+            f"Command Set SHA   : {profile.get('command_set_sha256')}",
+            f"Started           : {c.get('started')}",
+            f"Finished          : {c.get('finished')}",
+            f"Duration          : {c.get('duration_seconds')} seconds",
+            "",
+            f"{'DEVICE':24} {'IP ADDRESS':16} {'STATUS':16} {'COMMANDS':10} {'CFG':5} {'JSON FILE'}",
+            "-" * 108,
+        ]
+        display_status = {
+            "success": "SUCCESS",
+            "partial": "PARTIAL",
+            "connection_failed": "SSH FAILED",
+        }
+        for row in manifest.get("devices", []):
+            command_text = f"{row.get('commands_successful', 0)}/{row.get('commands_planned', 0)}"
+            status = display_status.get(row.get("status"), str(row.get("status", "")).upper())
+            json_file = row.get("files", {}).get("json", "")
+            cfg_available = "YES" if row.get("files", {}).get("running_config") else "—"
+            lines.append(
+                f"{str(row.get('name', ''))[:24]:24} {str(row.get('ip', ''))[:16]:16} "
+                f"{status[:16]:16} {command_text:10} {cfg_available:5} {json_file}"
+            )
+            if row.get("connection_error"):
+                lines.append(f"  ERROR: {row['connection_error']}")
+        lines.extend([
+            "",
+            "=" * 108,
+            "SUMMARY",
+            "=" * 108,
+            f"Devices Selected       : {summary.get('devices_selected', 0)}",
+            f"Connected              : {summary.get('connected', 0)}",
+            f"Successful             : {summary.get('successful', 0)}",
+            f"Partial                : {summary.get('partial', 0)}",
+            f"Failed Connection      : {summary.get('connection_failed', 0)}",
+            f"Running Config Backups : {sum(1 for row in manifest.get('devices', []) if row.get('files', {}).get('running_config'))}",
+            "=" * 108,
+            "",
+        ])
+        return "\n".join(lines)
+
+    def render_universal_log(self, result):
+        d = result["device"]
+        c = result["collection"]
+        conn = result["connection"]
+        profile = c.get("profile", {})
+        summary = result.get("summary", {})
+        lines = [
+            "=" * 92,
+            "NETMIKO UNIVERSAL COLLECTOR - DEVICE COLLECTION",
+            "=" * 92,
+            f"Schema            : {result.get('schema_name')} v{result.get('schema_version')} ({SCHEMA_STATUS})",
+            f"Document Type     : {result.get('document_type')}",
+            f"Collector Version : {result.get('collector', {}).get('version')}",
+            f"Collection ID     : {c.get('collection_id')}",
+            f"Command Profile   : {profile.get('name')}",
+            f"Profile File      : {profile.get('source_file')}",
+            f"Profile SHA-256   : {profile.get('profile_file_sha256')}",
+            f"Command Set SHA   : {profile.get('command_set_sha256')}",
+            f"Commands Planned  : {profile.get('total_command_count')}",
+            f"Started           : {c.get('started')}",
+            f"Finished          : {c.get('finished')}",
+            f"Duration          : {c.get('duration_seconds')} seconds",
+            "",
+            "DEVICE",
+            "-" * 92,
+            f"Name              : {d.get('name')}",
+            f"IP Address        : {d.get('ip')}",
+            f"Location          : {d.get('location')}",
+            f"Role              : {d.get('role')}",
+            f"Configured Type   : {d.get('configured_device_type')}",
+            "",
+            "CONNECTION",
+            "-" * 92,
+            f"Status            : {conn.get('status')}",
+            f"Netmiko Type      : {conn.get('netmiko_device_type')}",
+            f"Detected Prompt   : {conn.get('detected_prompt')}",
+            f"Credential Source : {conn.get('credential_source') or 'N/A'}",
+            f"Username          : {conn.get('username') or 'N/A'}",
+            f"Token Used        : {'Yes' if conn.get('token_used') else 'No'}",
+            f"Connection Error  : {conn.get('error') or 'None'}",
+            "",
+            "ARTIFACTS",
+            "-" * 92,
+            f"Running Config CFG: {result.get('artifacts', {}).get('running_config', {}).get('filename') or 'Not created'}",
+            "",
+            "OUTPUT CONTRACT",
+            "-" * 92,
+            "The command response below is preserved as returned by Netmiko send_command.",
+            "Only the echoed command and device prompt are stripped; output is not parsed or reformatted.",
+            "If a full running-config was collected successfully, a sibling .cfg recovery artifact may also be created.",
+            "The .cfg removes only Cisco display preamble; commands[].output remains untouched.",
+            "",
+            "=" * 92,
+            "COMMAND OUTPUT",
+            "=" * 92,
+        ]
+        if not result.get("commands"):
+            lines.extend(["", "No command output was collected.", ""])
+        for entry in result.get("commands", []):
+            lines.extend([
+                "",
+                "#" * 92,
+                f"COMMAND {entry.get('sequence'):02d}: {entry.get('command')}",
+                f"STATUS: {str(entry.get('status', '')).upper()} | SUCCESS: {'YES' if entry.get('success') else 'NO'}",
+                f"STARTED: {entry.get('started')} | FINISHED: {entry.get('finished')}",
+                f"DURATION: {entry.get('duration_seconds')} seconds",
+                "#" * 92,
+            ])
+            if entry.get("error"):
+                lines.append(f"[COLLECTOR ERROR] {entry['error']}")
+            lines.append(entry.get("output", ""))
+            lines.append("")
+
+        lines.extend([
+            "=" * 92,
+            "COLLECTION SUMMARY",
+            "=" * 92,
+            f"Overall Status      : {summary.get('overall_status')}",
+            f"Commands Planned    : {summary.get('commands_planned', 0)}",
+            f"Commands Attempted  : {summary.get('commands_attempted', 0)}",
+            f"Commands Successful : {summary.get('commands_successful', 0)}",
+            f"Commands Failed     : {summary.get('commands_failed', 0)}",
+            "=" * 92,
+            "",
+        ])
+        return "\n".join(lines)
+
+    # -------------------- Worker / UI --------------------
+
+    def start_worker(self, func, *args, operation_label="Working..."):
+        if self.busy:
+            messagebox.showinfo("Collector busy", "A collection or test is already running.")
+            return
+        self.busy = True
+        self.progress["value"] = 0
+        self.set_operation_visual("neutral", operation_label)
+        self.status_var.set(operation_label)
+        self.update_action_states()
+        threading.Thread(target=self._worker_wrapper, args=(func, args), daemon=True).start()
+
+    def _worker_wrapper(self, func, args):
+        result = None
+        try:
+            result = func(*args)
+        except Exception as exc:
+            self.ui_queue.put(("log", f"[UNHANDLED ERROR] {self.clean_exception(exc)}"))
+            result = {"state": "error", "status": "Operation Failed"}
+        finally:
+            self.ui_queue.put(("done", result or {"state": "success", "status": "Complete"}))
+
+    def qlog(self, text):
+        self.ui_queue.put(("log", text))
+
+    def qprogress(self, value):
+        self.ui_queue.put(("progress", value))
+
+    def process_ui_queue(self):
+        try:
+            while True:
+                kind, value = self.ui_queue.get_nowait()
+                if kind == "log":
+                    self.log_ui(value)
+                elif kind == "progress":
+                    self.progress["value"] = value
+                elif kind == "done":
+                    self.busy = False
+                    self.progress["value"] = 100
+                    result = value or {}
+                    state = result.get("state", "success")
+                    status = result.get("status", "Complete")
+                    self.set_operation_visual(state, status)
+                    self.status_var.set(status)
+                    last_dir = result.get("last_collection_dir")
+                    if last_dir:
+                        self.last_collection_dir = Path(last_dir)
+                        self.settings["last_collection_directory"] = str(self.last_collection_dir)
+                        atomic_write_json(SETTINGS_FILE, self.settings)
+                        self._refresh_last_collection_menu()
+                    self.clear_run_credentials()
+                    self.update_action_states()
+        except queue.Empty:
+            pass
+        self.after(100, self.process_ui_queue)
+
+    def log_ui(self, text):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.activity.insert("end", f"[{stamp}] {text}\n")
+        self.activity.see("end")
+
+    @staticmethod
+    def clean_exception(exc):
+        text = str(exc).strip().replace("\r", " ").replace("\n", " ")
+        return re.sub(r"\s+", " ", text)[:700]
+
+    # -------------------- File helpers --------------------
+
+    def open_output_folder(self):
+        path = Path(self.settings.get("output_directory", str(OUTPUT_DIR)))
+        path.mkdir(parents=True, exist_ok=True)
+        self.open_path(path)
+
+    def open_last_collection(self):
+        if self.last_collection_dir and Path(self.last_collection_dir).exists():
+            self.open_path(Path(self.last_collection_dir))
+        else:
+            messagebox.showinfo("Last Collection", "No saved collection is available yet.")
+            self._refresh_last_collection_menu()
+
+    def show_about(self):
+        messagebox.showinfo(
+            "About Netmiko Universal Collector",
+            f"{APP_NAME}\n{COLLECTOR_VERSION}\n\n"
+            "A read-only SSH collection utility built around shareable device libraries, "
+            "plain-text command profiles, and universal log output.",
+        )
+
+    def open_path(self, path: Path):
+        """Open a file or folder with resilient OS-specific fallbacks."""
+        path = Path(path).expanduser()
+
+        try:
+            if not path.exists() and not path.suffix:
+                path.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+        target = os.path.normpath(str(path))
+        system = platform.system().lower()
+        attempts = []
+
+        def attempt(label, launcher):
+            try:
+                launcher()
+                self.log_ui(f"[OPEN] {label}: {target}")
+                return True
+            except Exception as exc:
+                attempts.append(f"{label}: {self.clean_exception(exc)}")
+                return False
+
+        if system == "windows":
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+            if path.is_dir():
+                # Direct Explorer launch is reliable on managed Windows devices and
+                # supports local paths as well as UNC/network paths.
+                if attempt(
+                    "Windows Explorer",
+                    lambda: subprocess.Popen(
+                        ["explorer.exe", target],
+                        creationflags=flags,
+                    ),
+                ):
+                    return
+
+                if hasattr(os, "startfile") and attempt(
+                    "Windows shell",
+                    lambda: os.startfile(target),
+                ):
+                    return
+
+                if attempt(
+                    "Windows command shell",
+                    lambda: subprocess.Popen(
+                        ["cmd.exe", "/c", "start", "", target],
+                        creationflags=flags,
+                    ),
+                ):
+                    return
+            else:
+                # Open files using the workstation's registered application first.
+                if hasattr(os, "startfile") and attempt(
+                    "Windows file association",
+                    lambda: os.startfile(target),
+                ):
+                    return
+
+                if attempt(
+                    "Windows FileProtocolHandler",
+                    lambda: subprocess.Popen(
+                        ["rundll32.exe", "url.dll,FileProtocolHandler", target],
+                        creationflags=flags,
+                    ),
+                ):
+                    return
+
+                # Collector artifacts and command profiles are plain text, so
+                # Notepad is a dependable final direct-open fallback.
+                if path.suffix.lower() in {".txt", ".log", ".json", ".cfg"} and attempt(
+                    "Notepad fallback",
+                    lambda: subprocess.Popen(
+                        ["notepad.exe", target],
+                        creationflags=flags,
+                    ),
+                ):
+                    return
+
+                # Even if file association launch is blocked, reveal the file.
+                if attempt(
+                    "Windows Explorer select",
+                    lambda: subprocess.Popen(
+                        ["explorer.exe", f"/select,{target}"],
+                        creationflags=flags,
+                    ),
+                ):
+                    return
+
+        elif system == "darwin":
+            if attempt("macOS open", lambda: subprocess.Popen(["open", target])):
+                return
+        else:
+            if attempt("xdg-open", lambda: subprocess.Popen(["xdg-open", target])):
+                return
+
+        # If workstation policy blocks every launch mechanism, copy the path so
+        # the menu/button still gives the engineer an immediately usable result.
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(target)
+            self.update_idletasks()
+            clipboard_note = "\n\nThe path has been copied to your clipboard."
+        except Exception:
+            clipboard_note = ""
+
+        detail = "\n".join(attempts) if attempts else "No supported launch method succeeded."
+        messagebox.showerror(
+            "Could not open path",
+            f"The operating system would not open:\n\n{target}"
+            f"{clipboard_note}\n\nAttempts:\n{detail}",
+        )
+
+
+if __name__ == "__main__":
+    ensure_defaults()
+    app = CollectorApp()
+    app.mainloop()
