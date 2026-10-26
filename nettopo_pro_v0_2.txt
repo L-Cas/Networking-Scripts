@@ -1,0 +1,1555 @@
+#!/usr/bin/env python3
+"""
+NetTopo Pro v0.2
+================
+A lightweight, data-driven network topology editor built with PySide6.
+
+Design goals for v0.2
+---------------------
+- Fast, freeform editing canvas (Packet Tracer / Visio-like interaction).
+- Adobe-style docked properties inspector.
+- Spacebar + drag (or middle mouse drag) panning; mouse-wheel zoom.
+- Devices and physical links are the source of truth, not canvas coordinates.
+- Optional layout priority / preferred-root metadata for deterministic exports.
+- Clean orthogonal (90-degree) link rendering.
+- Export layout is reflowed independently from the working canvas.
+- PDF and SVG vector export.
+- JSON save/load, with forgiving loading of early v0.1-style field names.
+- Optional per-direction next-hop annotations on links without introducing a
+  full routing model yet.
+
+Requires:
+    pip install PySide6
+
+Run:
+    python nettopo_pro_v0_2.py
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import sys
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QKeySequence,
+    QPageLayout,
+    QPageSize,
+    QPainter,
+    QPainterPath,
+    QPdfWriter,
+    QPen,
+    QBrush,
+    QTransform,
+)
+from PySide6.QtSvg import QSvgGenerator
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDialog,
+    QDockWidget,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QGraphicsItem,
+    QGraphicsPathItem,
+    QGraphicsScene,
+    QGraphicsSimpleTextItem,
+    QGraphicsView,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QStackedWidget,
+    QStatusBar,
+    QTextEdit,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+APP_NAME = "NetTopo Pro"
+APP_VERSION = "0.2"
+
+NODE_W = 190.0
+NODE_H = 86.0
+GRID = 40
+
+DEVICE_TYPES = ["Switch", "Router", "Firewall", "WAN", "Other"]
+TOPOLOGY_ROLES = ["Auto", "Core", "Distribution", "Access", "Edge", "WAN", "Firewall", "Other"]
+STATUSES = ["Active", "Planned", "Retired"]
+MEDIA_TYPES = ["", "Fiber - SM", "Fiber - MM", "Copper", "DAC", "AOC", "Wireless", "Other"]
+SPEEDS = ["", "100M", "1G", "2.5G", "5G", "10G", "25G", "40G", "50G", "100G", "400G", "Other"]
+LINK_MODES = ["", "Access", "Trunk", "Routed", "Port-Channel Member", "Other"]
+
+ROLE_RANK = {
+    "Core": 0,
+    "Firewall": 1,
+    "WAN": 2,
+    "Distribution": 3,
+    "Edge": 4,
+    "Access": 5,
+    "Other": 6,
+    "Auto": 7,
+}
+
+TYPE_COLORS = {
+    "Switch": QColor("#dfe8f5"),
+    "Router": QColor("#e7e0f3"),
+    "Firewall": QColor("#f4e1de"),
+    "WAN": QColor("#e2eeee"),
+    "Other": QColor("#e8e8e8"),
+}
+
+
+def text(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def boolish(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def intish(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def first(d: dict[str, Any], *keys: str, default: Any = "") -> Any:
+    for key in keys:
+        if key in d and d[key] not in (None, ""):
+            return d[key]
+    return default
+
+
+class DeviceNode(QGraphicsItem):
+    """Draggable network-device node."""
+
+    def __init__(self, data: dict[str, Any]):
+        super().__init__()
+        self.data = data
+        self.links: list[LinkEdge] = []
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsMovable
+            | QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            | QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges
+        )
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setZValue(10)
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        return QRectF(-NODE_W / 2, -NODE_H / 2, NODE_W, NODE_H)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        rect = self.boundingRect()
+        dtype = text(self.data.get("device_type")) or "Other"
+        fill = TYPE_COLORS.get(dtype, TYPE_COLORS["Other"])
+
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor("#4c566a"), 1.5)
+        if self.isSelected():
+            pen = QPen(QColor("#2f6fed"), 3.0)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(fill))
+        painter.drawRoundedRect(rect, 10, 10)
+
+        header = QRectF(rect.left(), rect.top(), rect.width(), 22)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor("#2f3743")))
+        painter.drawRoundedRect(header, 10, 10)
+        painter.drawRect(QRectF(header.left(), header.bottom() - 10, header.width(), 10))
+
+        painter.setPen(QColor("white"))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(8)
+        painter.setFont(font)
+        painter.drawText(header.adjusted(8, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter, dtype.upper())
+
+        hostname = text(self.data.get("hostname")) or "UNNAMED"
+        painter.setPen(QColor("#1f2933"))
+        font.setPointSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.drawText(
+            QRectF(rect.left() + 9, rect.top() + 29, rect.width() - 18, 22),
+            Qt.AlignmentFlag.AlignCenter,
+            hostname,
+        )
+
+        detail_bits = [text(self.data.get("model")), text(self.data.get("room_closet"))]
+        detail = " • ".join(bit for bit in detail_bits if bit)
+        if not detail:
+            detail = text(self.data.get("topology_role")) or ""
+        painter.setPen(QColor("#5b6573"))
+        font.setPointSize(8)
+        font.setBold(False)
+        painter.setFont(font)
+        painter.drawText(
+            QRectF(rect.left() + 9, rect.top() + 53, rect.width() - 18, 20),
+            Qt.AlignmentFlag.AlignCenter,
+            detail,
+        )
+
+        if boolish(self.data.get("preferred_root")):
+            painter.setPen(QPen(QColor("#8a6417"), 1.2))
+            painter.setBrush(QBrush(QColor("#fff3c4")))
+            badge = QRectF(rect.right() - 48, rect.top() + 27, 39, 16)
+            painter.drawRoundedRect(badge, 4, 4)
+            painter.setPen(QColor("#604810"))
+            font.setPointSize(6)
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, "ROOT")
+
+    def itemChange(self, change, value):  # noqa: ANN001, N802
+        if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
+            self.data["x"] = float(value.x())
+            self.data["y"] = float(value.y())
+            for link in list(self.links):
+                link.update_geometry()
+        return super().itemChange(change, value)
+
+    def add_link(self, link: "LinkEdge") -> None:
+        if link not in self.links:
+            self.links.append(link)
+
+    def remove_link(self, link: "LinkEdge") -> None:
+        if link in self.links:
+            self.links.remove(link)
+
+
+class LinkEdge(QGraphicsPathItem):
+    """Selectable physical link rendered with an orthogonal path."""
+
+    def __init__(self, node_a: DeviceNode, node_b: DeviceNode, data: dict[str, Any]):
+        super().__init__()
+        self.node_a = node_a
+        self.node_b = node_b
+        self.data = data
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
+        self.setZValue(0)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setPen(QPen(QColor("#5c6673"), 2.0))
+
+        self.main_label = QGraphicsSimpleTextItem(self)
+        self.a_label = QGraphicsSimpleTextItem(self)
+        self.b_label = QGraphicsSimpleTextItem(self)
+        self.a_route_label = QGraphicsSimpleTextItem(self)
+        self.b_route_label = QGraphicsSimpleTextItem(self)
+        for label in [self.main_label, self.a_label, self.b_label, self.a_route_label, self.b_route_label]:
+            label.setZValue(2)
+            f = label.font()
+            f.setPointSize(7)
+            label.setFont(f)
+            label.setBrush(QBrush(QColor("#3f4752")))
+
+        node_a.add_link(self)
+        node_b.add_link(self)
+        self.update_geometry()
+
+    def detach(self) -> None:
+        self.node_a.remove_link(self)
+        self.node_b.remove_link(self)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:  # noqa: ANN001
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if self.isSelected():
+            self.setPen(QPen(QColor("#2f6fed"), 3.2))
+        else:
+            self.setPen(QPen(QColor("#5c6673"), 2.0))
+        super().paint(painter, option, widget)
+
+    def _orthogonal_path(self, a: QPointF, b: QPointF) -> QPainterPath:
+        path = QPainterPath(a)
+        dx = b.x() - a.x()
+        dy = b.y() - a.y()
+
+        # Prefer a simple single-bend or dog-leg route. Nodes are opaque, so
+        # center-to-center lines naturally disappear beneath the device boxes.
+        if abs(dx) >= abs(dy):
+            mid_x = (a.x() + b.x()) / 2.0
+            path.lineTo(mid_x, a.y())
+            path.lineTo(mid_x, b.y())
+        else:
+            mid_y = (a.y() + b.y()) / 2.0
+            path.lineTo(a.x(), mid_y)
+            path.lineTo(b.x(), mid_y)
+        path.lineTo(b)
+        return path
+
+    def update_geometry(self) -> None:
+        a = self.node_a.scenePos()
+        b = self.node_b.scenePos()
+        path = self._orthogonal_path(a, b)
+        self.setPath(path)
+        self.update_labels()
+
+    def update_labels(self) -> None:
+        speed = text(self.data.get("speed"))
+        media = text(self.data.get("media"))
+        mode = text(self.data.get("mode"))
+        bits = [x for x in (speed, media, mode) if x]
+        self.main_label.setText(" • ".join(bits))
+
+        self.a_label.setText(text(self.data.get("interface_a")))
+        self.b_label.setText(text(self.data.get("interface_b")))
+
+        show_routes = boolish(self.data.get("show_next_hops"))
+        a_hop = text(self.data.get("next_hop_a_to_b")) if show_routes else ""
+        b_hop = text(self.data.get("next_hop_b_to_a")) if show_routes else ""
+        self.a_route_label.setText(f"→ {a_hop}" if a_hop else "")
+        self.b_route_label.setText(f"→ {b_hop}" if b_hop else "")
+
+        path = self.path()
+        if path.elementCount() == 0:
+            return
+
+        def place(label: QGraphicsSimpleTextItem, fraction: float, above: bool = True) -> None:
+            if not label.text():
+                return
+            pt = path.pointAtPercent(fraction)
+            box = label.boundingRect()
+            x = pt.x() - box.width() / 2
+            y = pt.y() - box.height() - 4 if above else pt.y() + 4
+            label.setPos(x, y)
+
+        place(self.a_label, 0.16, True)
+        place(self.b_label, 0.84, True)
+        place(self.main_label, 0.50, False)
+        place(self.a_route_label, 0.25, False)
+        place(self.b_route_label, 0.75, False)
+
+    def refresh_from_data(self) -> None:
+        self.update_geometry()
+        self.update()
+
+    def display_name(self) -> str:
+        a = f"{text(self.node_a.data.get('hostname'))} {text(self.data.get('interface_a'))}".strip()
+        b = f"{text(self.node_b.data.get('hostname'))} {text(self.data.get('interface_b'))}".strip()
+        return f"{a} | {b}"
+
+
+class TopologyScene(QGraphicsScene):
+    linkRequested = Signal(object, object)
+    statusMessage = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.connect_mode = False
+        self.connect_source: DeviceNode | None = None
+        self.setSceneRect(-5000, -5000, 10000, 10000)
+
+    def set_connect_mode(self, enabled: bool) -> None:
+        self.connect_mode = enabled
+        self.connect_source = None
+        if enabled:
+            self.statusMessage.emit("Connect mode: click the first device, then the second device.")
+        else:
+            self.statusMessage.emit("Select mode.")
+
+    def drawBackground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
+        painter.fillRect(rect, QColor("#f7f8fa"))
+        painter.setPen(QPen(QColor("#e5e8ec"), 0.0))
+        left = math.floor(rect.left() / GRID) * GRID
+        top = math.floor(rect.top() / GRID) * GRID
+        x = left
+        while x < rect.right():
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            x += GRID
+        y = top
+        while y < rect.bottom():
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            y += GRID
+
+    @staticmethod
+    def node_from_item(item: QGraphicsItem | None) -> DeviceNode | None:
+        while item is not None:
+            if isinstance(item, DeviceNode):
+                return item
+            item = item.parentItem()
+        return None
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001, N802
+        if self.connect_mode and event.button() == Qt.MouseButton.LeftButton:
+            raw_item = self.itemAt(event.scenePos(), QTransform())
+            node = self.node_from_item(raw_item)
+            if node is None:
+                self.statusMessage.emit("Connect mode: click a device.")
+                event.accept()
+                return
+
+            if self.connect_source is None:
+                self.clearSelection()
+                self.connect_source = node
+                node.setSelected(True)
+                self.statusMessage.emit(
+                    f"Connect from {text(node.data.get('hostname'))}: click the destination device."
+                )
+            else:
+                source = self.connect_source
+                self.connect_source = None
+                if source is node:
+                    self.statusMessage.emit("A physical link needs two different devices.")
+                else:
+                    self.clearSelection()
+                    self.linkRequested.emit(source, node)
+                    self.statusMessage.emit("Link created. Select it to enter interfaces and link details.")
+                if source is node:
+                    self.clearSelection()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
+class TopologyView(QGraphicsView):
+    """Graphics view with Adobe-like spacebar pan and wheel zoom."""
+
+    deleteRequested = Signal()
+    selectRequested = Signal()
+
+    def __init__(self, scene: QGraphicsScene, parent=None):
+        super().__init__(scene, parent)
+        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._space_down = False
+        self._panning = False
+        self._last_pan_pos = None
+
+    def keyPressEvent(self, event) -> None:  # noqa: ANN001, N802
+        if event.key() == Qt.Key.Key_Delete:
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape:
+            self.selectRequested.emit()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_down = True
+            self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event) -> None:  # noqa: ANN001, N802
+        if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+            self._space_down = False
+            if not self._panning:
+                self.viewport().unsetCursor()
+            event.accept()
+            return
+        super().keyReleaseEvent(event)
+
+    def mousePressEvent(self, event) -> None:  # noqa: ANN001, N802
+        if self._space_down or event.button() == Qt.MouseButton.MiddleButton:
+            self._panning = True
+            self._last_pan_pos = event.position()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: ANN001, N802
+        if self._panning and self._last_pan_pos is not None:
+            delta = event.position() - self._last_pan_pos
+            self._last_pan_pos = event.position()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - int(delta.x()))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - int(delta.y()))
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: ANN001, N802
+        if self._panning:
+            self._panning = False
+            self._last_pan_pos = None
+            self.viewport().setCursor(
+                Qt.CursorShape.OpenHandCursor if self._space_down else Qt.CursorShape.ArrowCursor
+            )
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event) -> None:  # noqa: ANN001, N802
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        current = self.transform().m11()
+        target = current * factor
+        if 0.15 <= target <= 5.0:
+            self.scale(factor, factor)
+        event.accept()
+
+    def fit_all(self) -> None:
+        items_rect = self.scene().itemsBoundingRect()
+        if not items_rect.isNull():
+            self.fitInView(items_rect.adjusted(-80, -80, 80, 80), Qt.AspectRatioMode.KeepAspectRatio)
+
+
+class Inspector(QWidget):
+    """Adobe-style context-sensitive properties panel."""
+
+    itemEdited = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_item: DeviceNode | LinkEdge | None = None
+        self.loading = False
+        self.stack = QStackedWidget()
+        self.empty_page = self._build_empty()
+        self.device_page = self._build_device_page()
+        self.link_page = self._build_link_page()
+        self.stack.addWidget(self.empty_page)
+        self.stack.addWidget(self.device_page)
+        self.stack.addWidget(self.link_page)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.stack)
+
+    @staticmethod
+    def _section_label(title: str) -> QLabel:
+        label = QLabel(title)
+        f = label.font()
+        f.setBold(True)
+        f.setPointSize(10)
+        label.setFont(f)
+        return label
+
+    def _scroll_form(self, title: str) -> tuple[QWidget, QFormLayout]:
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(10, 10, 10, 10)
+        body_layout.addWidget(self._section_label(title))
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        body_layout.addWidget(line)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        body_layout.addLayout(form)
+        body_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(body)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(scroll)
+        return page, form
+
+    def _build_empty(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+        title = QLabel("Properties")
+        f = title.font()
+        f.setBold(True)
+        f.setPointSize(11)
+        title.setFont(f)
+        layout.addWidget(title)
+        info = QLabel(
+            "Select a device or physical link on the canvas.\n\n"
+            "Device fields and link fields are edited here without opening a separate dialog."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        layout.addStretch(1)
+        return page
+
+    def _build_device_page(self) -> QWidget:
+        page, form = self._scroll_form("Device Properties")
+        self.d_hostname = QLineEdit()
+        self.d_serial = QLineEdit()
+        self.d_loopback = QLineEdit()
+        self.d_program = QLineEdit()
+        self.d_site = QLineEdit()
+        self.d_room = QLineEdit()
+        self.d_type = QComboBox(); self.d_type.addItems(DEVICE_TYPES)
+        self.d_model = QLineEdit()
+        self.d_status = QComboBox(); self.d_status.addItems(STATUSES)
+        self.d_role = QComboBox(); self.d_role.addItems(TOPOLOGY_ROLES)
+        self.d_priority = QSpinBox(); self.d_priority.setRange(0, 99); self.d_priority.setSpecialValueText("Auto")
+        self.d_root = QCheckBox("Preferred export root")
+        self.d_notes = QTextEdit(); self.d_notes.setMinimumHeight(80)
+
+        form.addRow("Hostname", self.d_hostname)
+        form.addRow("S/N", self.d_serial)
+        form.addRow("Loopback", self.d_loopback)
+        form.addRow("Program", self.d_program)
+        form.addRow("Site", self.d_site)
+        form.addRow("Room / Closet", self.d_room)
+        form.addRow("Device Type", self.d_type)
+        form.addRow("Model", self.d_model)
+        form.addRow("Status", self.d_status)
+        form.addRow("Topology Role", self.d_role)
+        form.addRow("Layout Priority", self.d_priority)
+        form.addRow("", self.d_root)
+        form.addRow("Notes", self.d_notes)
+
+        for widget in [
+            self.d_hostname, self.d_serial, self.d_loopback, self.d_program,
+            self.d_site, self.d_room, self.d_model,
+        ]:
+            widget.editingFinished.connect(self._write_device)
+        for combo in [self.d_type, self.d_status, self.d_role]:
+            combo.currentTextChanged.connect(self._write_device)
+        self.d_priority.valueChanged.connect(self._write_device)
+        self.d_root.toggled.connect(self._write_device)
+        self.d_notes.textChanged.connect(self._write_device)
+        return page
+
+    def _build_link_page(self) -> QWidget:
+        page, form = self._scroll_form("Physical Link Properties")
+        self.l_a_host = QLineEdit(); self.l_a_host.setReadOnly(True)
+        self.l_a_int = QLineEdit()
+        self.l_b_host = QLineEdit(); self.l_b_host.setReadOnly(True)
+        self.l_b_int = QLineEdit()
+        self.l_media = QComboBox(); self.l_media.setEditable(True); self.l_media.addItems(MEDIA_TYPES)
+        self.l_speed = QComboBox(); self.l_speed.setEditable(True); self.l_speed.addItems(SPEEDS)
+        self.l_mode = QComboBox(); self.l_mode.setEditable(True); self.l_mode.addItems(LINK_MODES)
+        self.l_status = QComboBox(); self.l_status.addItems(STATUSES)
+        self.l_networks = QLineEdit(); self.l_networks.setPlaceholderText("Optional: Voice | 220, Data | 120")
+        self.l_hop_a = QLineEdit(); self.l_hop_a.setPlaceholderText("Optional directional next hop")
+        self.l_hop_b = QLineEdit(); self.l_hop_b.setPlaceholderText("Optional directional next hop")
+        self.l_show_hops = QCheckBox("Show next-hop annotations on drawing/export")
+        self.l_notes = QTextEdit(); self.l_notes.setMinimumHeight(80)
+
+        form.addRow("Hostname A", self.l_a_host)
+        form.addRow("Interface A", self.l_a_int)
+        form.addRow("Hostname B", self.l_b_host)
+        form.addRow("Interface B", self.l_b_int)
+        form.addRow("Media", self.l_media)
+        form.addRow("Speed", self.l_speed)
+        form.addRow("Mode", self.l_mode)
+        form.addRow("Status", self.l_status)
+        form.addRow("Networks Carried", self.l_networks)
+        form.addRow("Next Hop A → B", self.l_hop_a)
+        form.addRow("Next Hop B → A", self.l_hop_b)
+        form.addRow("", self.l_show_hops)
+        form.addRow("Notes", self.l_notes)
+
+        for widget in [self.l_a_int, self.l_b_int, self.l_networks, self.l_hop_a, self.l_hop_b]:
+            widget.editingFinished.connect(self._write_link)
+        for combo in [self.l_media, self.l_speed, self.l_mode, self.l_status]:
+            combo.currentTextChanged.connect(self._write_link)
+        self.l_show_hops.toggled.connect(self._write_link)
+        self.l_notes.textChanged.connect(self._write_link)
+        return page
+
+    def set_item(self, item: DeviceNode | LinkEdge | None) -> None:
+        self.current_item = item
+        self.loading = True
+        try:
+            if isinstance(item, DeviceNode):
+                d = item.data
+                self.d_hostname.setText(text(d.get("hostname")))
+                self.d_serial.setText(text(d.get("serial")))
+                self.d_loopback.setText(text(d.get("loopback")))
+                self.d_program.setText(text(d.get("program")))
+                self.d_site.setText(text(d.get("site")))
+                self.d_room.setText(text(d.get("room_closet")))
+                self._set_combo(self.d_type, text(d.get("device_type")) or "Switch")
+                self.d_model.setText(text(d.get("model")))
+                self._set_combo(self.d_status, text(d.get("status")) or "Active")
+                self._set_combo(self.d_role, text(d.get("topology_role")) or "Auto")
+                self.d_priority.setValue(intish(d.get("layout_priority"), 0))
+                self.d_root.setChecked(boolish(d.get("preferred_root")))
+                self.d_notes.setPlainText(text(d.get("notes")))
+                self.stack.setCurrentWidget(self.device_page)
+            elif isinstance(item, LinkEdge):
+                d = item.data
+                self.l_a_host.setText(text(item.node_a.data.get("hostname")))
+                self.l_a_int.setText(text(d.get("interface_a")))
+                self.l_b_host.setText(text(item.node_b.data.get("hostname")))
+                self.l_b_int.setText(text(d.get("interface_b")))
+                self._set_combo(self.l_media, text(d.get("media")))
+                self._set_combo(self.l_speed, text(d.get("speed")))
+                self._set_combo(self.l_mode, text(d.get("mode")))
+                self._set_combo(self.l_status, text(d.get("status")) or "Active")
+                networks = d.get("networks", [])
+                if isinstance(networks, list):
+                    networks = ", ".join(text(x) for x in networks if text(x))
+                self.l_networks.setText(text(networks))
+                self.l_hop_a.setText(text(d.get("next_hop_a_to_b")))
+                self.l_hop_b.setText(text(d.get("next_hop_b_to_a")))
+                self.l_show_hops.setChecked(boolish(d.get("show_next_hops")))
+                self.l_notes.setPlainText(text(d.get("notes")))
+                self.stack.setCurrentWidget(self.link_page)
+            else:
+                self.stack.setCurrentWidget(self.empty_page)
+        finally:
+            self.loading = False
+
+    @staticmethod
+    def _set_combo(combo: QComboBox, value: str) -> None:
+        index = combo.findText(value)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        elif combo.isEditable():
+            combo.setEditText(value)
+
+    def _write_device(self, *args) -> None:  # noqa: ANN002
+        if self.loading or not isinstance(self.current_item, DeviceNode):
+            return
+        d = self.current_item.data
+        d.update(
+            {
+                "hostname": self.d_hostname.text().strip(),
+                "serial": self.d_serial.text().strip(),
+                "loopback": self.d_loopback.text().strip(),
+                "program": self.d_program.text().strip(),
+                "site": self.d_site.text().strip(),
+                "room_closet": self.d_room.text().strip(),
+                "device_type": self.d_type.currentText().strip(),
+                "model": self.d_model.text().strip(),
+                "status": self.d_status.currentText().strip(),
+                "topology_role": self.d_role.currentText().strip(),
+                "layout_priority": self.d_priority.value(),
+                "preferred_root": self.d_root.isChecked(),
+                "notes": self.d_notes.toPlainText(),
+            }
+        )
+        self.current_item.update()
+        for link in list(self.current_item.links):
+            link.refresh_from_data()
+        self.itemEdited.emit(self.current_item)
+
+    def _write_link(self, *args) -> None:  # noqa: ANN002
+        if self.loading or not isinstance(self.current_item, LinkEdge):
+            return
+        d = self.current_item.data
+        d.update(
+            {
+                "interface_a": self.l_a_int.text().strip(),
+                "interface_b": self.l_b_int.text().strip(),
+                "media": self.l_media.currentText().strip(),
+                "speed": self.l_speed.currentText().strip(),
+                "mode": self.l_mode.currentText().strip(),
+                "status": self.l_status.currentText().strip(),
+                "networks": [
+                    part.strip() for part in self.l_networks.text().split(",") if part.strip()
+                ],
+                "next_hop_a_to_b": self.l_hop_a.text().strip(),
+                "next_hop_b_to_a": self.l_hop_b.text().strip(),
+                "show_next_hops": self.l_show_hops.isChecked(),
+                "notes": self.l_notes.toPlainText(),
+            }
+        )
+        self.current_item.refresh_from_data()
+        self.itemEdited.emit(self.current_item)
+
+
+@dataclass
+class ComponentLayout:
+    nodes: list[DeviceNode]
+    root: DeviceNode
+    levels: list[list[DeviceNode]]
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.resize(1440, 860)
+        self.current_file: Path | None = None
+        self.dirty = False
+        self.device_counter = defaultdict(int)
+
+        self.scene = TopologyScene(self)
+        self.view = TopologyView(self.scene, self)
+        self.setCentralWidget(self.view)
+
+        self.inspector = Inspector()
+        self._build_inspector_dock()
+        self._build_palette_dock()
+        self._build_toolbar()
+        self._build_statusbar()
+
+        self.scene.selectionChanged.connect(self._selection_changed)
+        self.scene.linkRequested.connect(self._create_link)
+        self.scene.statusMessage.connect(self.statusBar().showMessage)
+        self.inspector.itemEdited.connect(self._item_edited)
+        self.view.deleteRequested.connect(self.delete_selected)
+        self.view.selectRequested.connect(lambda: self._set_mode(False))
+
+        self.statusBar().showMessage("Ready — add devices from the left. Hold Space and drag to pan.")
+
+    # ---------- UI ----------
+    def _build_inspector_dock(self) -> None:
+        dock = QDockWidget("Properties", self)
+        dock.setObjectName("propertiesDock")
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        dock.setWidget(self.inspector)
+        dock.setMinimumWidth(310)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+
+    def _build_palette_dock(self) -> None:
+        dock = QDockWidget("Devices", self)
+        dock.setObjectName("paletteDock")
+        dock.setAllowedAreas(Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea)
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(10, 10, 10, 10)
+        description = QLabel("Add a device, drag it into place, then use Connect to create physical links.")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+        for dtype in ["Switch", "Router", "Firewall", "WAN"]:
+            button = QPushButton(f"+  {dtype}")
+            button.setMinimumHeight(38)
+            button.clicked.connect(lambda checked=False, t=dtype: self.add_device(t))
+            layout.addWidget(button)
+        layout.addStretch(1)
+        hint = QLabel("Navigation\n• Space + drag: pan\n• Middle drag: pan\n• Mouse wheel: zoom\n• Delete: remove selected")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        dock.setWidget(panel)
+        dock.setMinimumWidth(190)
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, dock)
+
+    def _build_toolbar(self) -> None:
+        toolbar = QToolBar("Main", self)
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+
+        self.select_action = QAction("Select", self)
+        self.select_action.setCheckable(True)
+        self.select_action.setChecked(True)
+        self.select_action.triggered.connect(lambda checked=False: self._set_mode(False))
+        toolbar.addAction(self.select_action)
+
+        self.connect_action = QAction("Connect", self)
+        self.connect_action.setCheckable(True)
+        self.connect_action.triggered.connect(lambda checked=False: self._set_mode(True))
+        toolbar.addAction(self.connect_action)
+
+        toolbar.addSeparator()
+
+        fit_action = QAction("Fit", self)
+        fit_action.setShortcut(QKeySequence("Ctrl+0"))
+        fit_action.triggered.connect(self.view.fit_all)
+        toolbar.addAction(fit_action)
+
+        delete_action = QAction("Delete", self)
+        delete_action.triggered.connect(self.delete_selected)
+        toolbar.addAction(delete_action)
+
+        toolbar.addSeparator()
+
+        save_action = QAction("Save", self)
+        save_action.setShortcut(QKeySequence.StandardKey.Save)
+        save_action.triggered.connect(self.save)
+        toolbar.addAction(save_action)
+
+        load_action = QAction("Open", self)
+        load_action.setShortcut(QKeySequence.StandardKey.Open)
+        load_action.triggered.connect(self.load)
+        toolbar.addAction(load_action)
+
+        toolbar.addSeparator()
+
+        preview_action = QAction("Export Preview", self)
+        preview_action.triggered.connect(self.preview_export_layout)
+        toolbar.addAction(preview_action)
+
+        pdf_action = QAction("Export PDF", self)
+        pdf_action.triggered.connect(self.export_pdf)
+        toolbar.addAction(pdf_action)
+
+        svg_action = QAction("Export SVG", self)
+        svg_action.triggered.connect(self.export_svg)
+        toolbar.addAction(svg_action)
+
+        toolbar.addSeparator()
+        demo_action = QAction("Demo", self)
+        demo_action.triggered.connect(self.load_demo)
+        toolbar.addAction(demo_action)
+
+    def _build_statusbar(self) -> None:
+        status = QStatusBar(self)
+        self.setStatusBar(status)
+        self.count_label = QLabel()
+        status.addPermanentWidget(self.count_label)
+        self._update_counts()
+
+    def _set_mode(self, connect: bool) -> None:
+        self.scene.set_connect_mode(connect)
+        self.connect_action.blockSignals(True)
+        self.select_action.blockSignals(True)
+        self.connect_action.setChecked(connect)
+        self.select_action.setChecked(not connect)
+        self.connect_action.blockSignals(False)
+        self.select_action.blockSignals(False)
+
+    # ---------- Object helpers ----------
+    def device_nodes(self) -> list[DeviceNode]:
+        return [item for item in self.scene.items() if isinstance(item, DeviceNode)]
+
+    def link_edges(self) -> list[LinkEdge]:
+        return [item for item in self.scene.items() if isinstance(item, LinkEdge)]
+
+    def _default_hostname(self, dtype: str) -> str:
+        prefix = {
+            "Switch": "SW",
+            "Router": "RTR",
+            "Firewall": "FW",
+            "WAN": "WAN",
+            "Other": "DEV",
+        }.get(dtype, "DEV")
+        used = {text(node.data.get("hostname")).upper() for node in self.device_nodes()}
+        while True:
+            self.device_counter[prefix] += 1
+            candidate = f"{prefix}-{self.device_counter[prefix]:02d}"
+            if candidate.upper() not in used:
+                return candidate
+
+    def add_device(self, dtype: str, pos: QPointF | None = None, data: dict[str, Any] | None = None) -> DeviceNode:
+        if data is None:
+            data = {
+                "hostname": self._default_hostname(dtype),
+                "serial": "",
+                "loopback": "",
+                "program": "",
+                "site": "",
+                "room_closet": "",
+                "device_type": dtype,
+                "model": "",
+                "status": "Active",
+                "notes": "",
+                "topology_role": "Auto",
+                "layout_priority": 0,
+                "preferred_root": False,
+                "x": 0.0,
+                "y": 0.0,
+            }
+        else:
+            data = self._normalize_device(data)
+
+        node = DeviceNode(data)
+        self.scene.addItem(node)
+        if pos is None:
+            center = self.view.mapToScene(self.view.viewport().rect().center())
+            offset = len(self.device_nodes()) * 14
+            pos = center + QPointF(offset, offset)
+        node.setPos(pos)
+        node.data["x"] = float(node.pos().x())
+        node.data["y"] = float(node.pos().y())
+        self.scene.clearSelection()
+        node.setSelected(True)
+        self._mark_dirty()
+        self._update_counts()
+        return node
+
+    def _create_link(self, node_a: DeviceNode, node_b: DeviceNode, data: dict[str, Any] | None = None) -> LinkEdge:
+        data = self._normalize_link(data or {})
+        edge = LinkEdge(node_a, node_b, data)
+        self.scene.addItem(edge)
+        self.scene.clearSelection()
+        edge.setSelected(True)
+        self._mark_dirty()
+        self._update_counts()
+        return edge
+
+    @staticmethod
+    def _normalize_device(raw: dict[str, Any]) -> dict[str, Any]:
+        dtype = text(first(raw, "device_type", "type", default="Switch")) or "Switch"
+        status_raw = first(raw, "status", "active", default="Active")
+        if isinstance(status_raw, bool):
+            status = "Active" if status_raw else "Retired"
+        else:
+            status = text(status_raw) or "Active"
+        return {
+            "hostname": text(first(raw, "hostname", "name", default="UNNAMED")),
+            "serial": text(first(raw, "serial", "s_n", "sn")),
+            "loopback": text(first(raw, "loopback", "loopback_ip")),
+            "program": text(raw.get("program")),
+            "site": text(raw.get("site")),
+            "room_closet": text(first(raw, "room_closet", "room", "closet")),
+            "device_type": dtype if dtype in DEVICE_TYPES else dtype,
+            "model": text(raw.get("model")),
+            "status": status,
+            "notes": text(raw.get("notes")),
+            "topology_role": text(first(raw, "topology_role", "role", default="Auto")) or "Auto",
+            "layout_priority": intish(first(raw, "layout_priority", "priority", default=0), 0),
+            "preferred_root": boolish(first(raw, "preferred_root", "root", default=False)),
+            "x": float(first(raw, "x", default=0.0) or 0.0),
+            "y": float(first(raw, "y", default=0.0) or 0.0),
+        }
+
+    @staticmethod
+    def _normalize_link(raw: dict[str, Any]) -> dict[str, Any]:
+        networks = raw.get("networks", raw.get("networks_carried", []))
+        if isinstance(networks, str):
+            networks = [x.strip() for x in networks.split(",") if x.strip()]
+        if not isinstance(networks, list):
+            networks = []
+        status_raw = first(raw, "status", "active", default="Active")
+        if isinstance(status_raw, bool):
+            status = "Active" if status_raw else "Retired"
+        else:
+            status = text(status_raw) or "Active"
+        return {
+            "interface_a": text(first(raw, "interface_a", "a_interface", "port_a")),
+            "interface_b": text(first(raw, "interface_b", "b_interface", "port_b")),
+            "media": text(raw.get("media")),
+            "speed": text(raw.get("speed")),
+            "mode": text(raw.get("mode")),
+            "status": status,
+            "notes": text(raw.get("notes")),
+            "networks": [text(x) for x in networks if text(x)],
+            "next_hop_a_to_b": text(first(raw, "next_hop_a_to_b", "next_hop_a")),
+            "next_hop_b_to_a": text(first(raw, "next_hop_b_to_a", "next_hop_b")),
+            "show_next_hops": boolish(first(raw, "show_next_hops", "show_route_labels", default=False)),
+        }
+
+    # ---------- Selection / editing ----------
+    def _selection_changed(self) -> None:
+        selected = self.scene.selectedItems()
+        editable = None
+        for item in selected:
+            if isinstance(item, (DeviceNode, LinkEdge)):
+                editable = item
+                break
+        self.inspector.set_item(editable)
+
+    def _item_edited(self, item) -> None:  # noqa: ANN001
+        self._mark_dirty()
+        if isinstance(item, DeviceNode):
+            for edge in item.links:
+                edge.refresh_from_data()
+        self._update_counts()
+
+    def delete_selected(self) -> None:
+        selected = list(self.scene.selectedItems())
+        if not selected:
+            return
+        links_to_remove: set[LinkEdge] = set()
+        nodes_to_remove: set[DeviceNode] = set()
+        for item in selected:
+            if isinstance(item, LinkEdge):
+                links_to_remove.add(item)
+            elif isinstance(item, DeviceNode):
+                nodes_to_remove.add(item)
+                links_to_remove.update(item.links)
+
+        for edge in links_to_remove:
+            edge.detach()
+            self.scene.removeItem(edge)
+        for node in nodes_to_remove:
+            self.scene.removeItem(node)
+        self.inspector.set_item(None)
+        self._mark_dirty()
+        self._update_counts()
+
+    def _update_counts(self) -> None:
+        self.count_label.setText(f"Devices: {len(self.device_nodes())}    Links: {len(self.link_edges())}")
+
+    def _mark_dirty(self) -> None:
+        self.dirty = True
+        base = self.current_file.name if self.current_file else f"{APP_NAME} v{APP_VERSION}"
+        if not self.windowTitle().startswith("*"):
+            self.setWindowTitle(f"* {base}")
+
+    def _mark_clean(self) -> None:
+        self.dirty = False
+        base = self.current_file.name if self.current_file else f"{APP_NAME} v{APP_VERSION}"
+        self.setWindowTitle(base)
+
+    # ---------- Validation ----------
+    def validate_topology(self, for_export: bool = False) -> list[str]:
+        warnings: list[str] = []
+        hostnames = [text(n.data.get("hostname")) for n in self.device_nodes()]
+        blanks = [h for h in hostnames if not h]
+        if blanks:
+            warnings.append(f"{len(blanks)} device(s) have a blank hostname.")
+
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for hostname in hostnames:
+            key = hostname.upper()
+            if key and key in seen:
+                duplicates.add(hostname)
+            seen.add(key)
+        if duplicates:
+            warnings.append("Duplicate hostnames: " + ", ".join(sorted(duplicates)))
+
+        if for_export and not self.device_nodes():
+            warnings.append("There are no devices to export.")
+        return warnings
+
+    # ---------- JSON persistence ----------
+    def topology_payload(self) -> dict[str, Any]:
+        devices = []
+        for node in sorted(self.device_nodes(), key=lambda n: text(n.data.get("hostname")).upper()):
+            d = dict(node.data)
+            d["x"] = float(node.pos().x())
+            d["y"] = float(node.pos().y())
+            devices.append(d)
+
+        links = []
+        for edge in self.link_edges():
+            row = dict(edge.data)
+            row["hostname_a"] = text(edge.node_a.data.get("hostname"))
+            row["hostname_b"] = text(edge.node_b.data.get("hostname"))
+            links.append(row)
+
+        return {
+            "format": "nettopo",
+            "version": APP_VERSION,
+            "devices": devices,
+            "links": links,
+        }
+
+    def save(self) -> None:
+        warnings = self.validate_topology()
+        if any("Duplicate hostnames" in w or "blank hostname" in w for w in warnings):
+            QMessageBox.warning(self, "Topology validation", "\n".join(warnings))
+
+        if self.current_file is None:
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Save topology", "topology.json", "NetTopo JSON (*.json);;All files (*.*)"
+            )
+            if not filename:
+                return
+            self.current_file = Path(filename)
+
+        try:
+            self.current_file.write_text(json.dumps(self.topology_payload(), indent=2), encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Save failed", str(exc))
+            return
+        self._mark_clean()
+        self.statusBar().showMessage(f"Saved {self.current_file}", 5000)
+
+    def load(self) -> None:
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Open topology", "", "NetTopo JSON (*.json);;All files (*.*)"
+        )
+        if not filename:
+            return
+        try:
+            payload = json.loads(Path(filename).read_text(encoding="utf-8"))
+            self.load_payload(payload)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Open failed", str(exc))
+            return
+        self.current_file = Path(filename)
+        self._mark_clean()
+        self.statusBar().showMessage(f"Opened {filename}", 5000)
+        self.view.fit_all()
+
+    def clear_topology(self) -> None:
+        for edge in self.link_edges():
+            edge.detach()
+        self.scene.clear()
+        self.inspector.set_item(None)
+        self._update_counts()
+
+    def load_payload(self, payload: dict[str, Any]) -> None:
+        self.clear_topology()
+        devices_raw = payload.get("devices", payload.get("nodes", [])) or []
+        links_raw = payload.get("links", payload.get("connections", [])) or []
+
+        by_hostname: dict[str, DeviceNode] = {}
+        for raw in devices_raw:
+            if not isinstance(raw, dict):
+                continue
+            d = self._normalize_device(raw)
+            node = self.add_device(
+                d.get("device_type", "Switch"),
+                QPointF(float(d.get("x", 0.0)), float(d.get("y", 0.0))),
+                d,
+            )
+            by_hostname[text(d.get("hostname")).upper()] = node
+
+        for raw in links_raw:
+            if not isinstance(raw, dict):
+                continue
+            a_name = text(first(raw, "hostname_a", "a", "source", "from"))
+            b_name = text(first(raw, "hostname_b", "b", "target", "to"))
+            a = by_hostname.get(a_name.upper())
+            b = by_hostname.get(b_name.upper())
+            if a is None or b is None or a is b:
+                continue
+            self._create_link(a, b, raw)
+
+        self.scene.clearSelection()
+        self.inspector.set_item(None)
+        self._update_counts()
+        self.dirty = False
+
+    # ---------- Export-layout engine ----------
+    def _adjacency(self, nodes: Iterable[DeviceNode], links: Iterable[LinkEdge]) -> dict[DeviceNode, set[DeviceNode]]:
+        adjacency: dict[DeviceNode, set[DeviceNode]] = {n: set() for n in nodes}
+        for edge in links:
+            if edge.node_a in adjacency and edge.node_b in adjacency:
+                adjacency[edge.node_a].add(edge.node_b)
+                adjacency[edge.node_b].add(edge.node_a)
+        return adjacency
+
+    def _connected_components(self, nodes: list[DeviceNode], adjacency: dict[DeviceNode, set[DeviceNode]]) -> list[list[DeviceNode]]:
+        remaining = set(nodes)
+        components: list[list[DeviceNode]] = []
+        while remaining:
+            start = next(iter(remaining))
+            queue = [start]
+            comp: list[DeviceNode] = []
+            remaining.remove(start)
+            while queue:
+                node = queue.pop()
+                comp.append(node)
+                for neighbor in adjacency[node]:
+                    if neighbor in remaining:
+                        remaining.remove(neighbor)
+                        queue.append(neighbor)
+            components.append(comp)
+        components.sort(key=lambda c: (-len(c), min(text(n.data.get("hostname")) for n in c)))
+        return components
+
+    def _root_for_component(self, comp: list[DeviceNode], adjacency: dict[DeviceNode, set[DeviceNode]]) -> DeviceNode:
+        preferred = [n for n in comp if boolish(n.data.get("preferred_root"))]
+        pool = preferred if preferred else comp
+
+        explicit = [n for n in pool if intish(n.data.get("layout_priority"), 0) > 0]
+        if explicit:
+            return min(
+                explicit,
+                key=lambda n: (
+                    intish(n.data.get("layout_priority"), 999),
+                    ROLE_RANK.get(text(n.data.get("topology_role")), 99),
+                    -len(adjacency[n]),
+                    text(n.data.get("hostname")).upper(),
+                ),
+            )
+        if preferred:
+            return min(
+                preferred,
+                key=lambda n: (
+                    ROLE_RANK.get(text(n.data.get("topology_role")), 99),
+                    -len(adjacency[n]),
+                    text(n.data.get("hostname")).upper(),
+                ),
+            )
+        return min(
+            comp,
+            key=lambda n: (
+                ROLE_RANK.get(text(n.data.get("topology_role")), 99),
+                -len(adjacency[n]),
+                text(n.data.get("hostname")).upper(),
+            ),
+        )
+
+    def _component_layout(self, comp: list[DeviceNode], adjacency: dict[DeviceNode, set[DeviceNode]]) -> ComponentLayout:
+        root = self._root_for_component(comp, adjacency)
+        dist: dict[DeviceNode, int] = {root: 0}
+        queue = deque([root])
+        while queue:
+            current = queue.popleft()
+            for neighbor in sorted(adjacency[current], key=lambda n: text(n.data.get("hostname")).upper()):
+                if neighbor not in dist:
+                    dist[neighbor] = dist[current] + 1
+                    queue.append(neighbor)
+
+        max_level = max(dist.values(), default=0)
+        levels: list[list[DeviceNode]] = []
+        for level in range(max_level + 1):
+            members = [n for n in comp if dist.get(n, 0) == level]
+            members.sort(
+                key=lambda n: (
+                    intish(n.data.get("layout_priority"), 0) or 999,
+                    ROLE_RANK.get(text(n.data.get("topology_role")), 99),
+                    text(n.data.get("hostname")).upper(),
+                )
+            )
+            levels.append(members)
+        return ComponentLayout(comp, root, levels)
+
+    def compute_export_positions(self) -> dict[DeviceNode, QPointF]:
+        nodes = self.device_nodes()
+        links = self.link_edges()
+        adjacency = self._adjacency(nodes, links)
+        components = self._connected_components(nodes, adjacency)
+
+        result: dict[DeviceNode, QPointF] = {}
+        component_gap = 420.0
+        x_cursor = 0.0
+        x_spacing = 275.0
+        y_spacing = 190.0
+
+        for comp in components:
+            layout = self._component_layout(comp, adjacency)
+            widest = max((len(level) for level in layout.levels), default=1)
+            width = max(420.0, (widest - 1) * x_spacing + NODE_W + 140)
+            center_x = x_cursor + width / 2
+            for level_index, level_nodes in enumerate(layout.levels):
+                if not level_nodes:
+                    continue
+                row_width = (len(level_nodes) - 1) * x_spacing
+                start_x = center_x - row_width / 2
+                for i, node in enumerate(level_nodes):
+                    result[node] = QPointF(start_x + i * x_spacing, 90 + level_index * y_spacing)
+            x_cursor += width + component_gap
+        return result
+
+    def _export_scene(self) -> QGraphicsScene:
+        export = QGraphicsScene()
+        export.setBackgroundBrush(QBrush(QColor("white")))
+        positions = self.compute_export_positions()
+        clone_map: dict[DeviceNode, DeviceNode] = {}
+
+        for source, pos in positions.items():
+            clone = DeviceNode(dict(source.data))
+            clone.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+            clone.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+            export.addItem(clone)
+            clone.setPos(pos)
+            clone_map[source] = clone
+
+        for edge in self.link_edges():
+            if edge.node_a not in clone_map or edge.node_b not in clone_map:
+                continue
+            clone_edge = LinkEdge(clone_map[edge.node_a], clone_map[edge.node_b], dict(edge.data))
+            clone_edge.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+            export.addItem(clone_edge)
+
+        title = QGraphicsSimpleTextItem(self._export_title())
+        f = QFont()
+        f.setPointSize(16)
+        f.setBold(True)
+        title.setFont(f)
+        title.setBrush(QBrush(QColor("#1f2933")))
+        export.addItem(title)
+        content = export.itemsBoundingRect()
+        title.setPos(content.left(), max(-60.0, content.top() - 50.0))
+        return export
+
+    def _export_title(self) -> str:
+        if self.current_file:
+            return self.current_file.stem.replace("_", " ")
+        return "Network Physical Topology"
+
+    def _component_summary(self) -> tuple[int, list[int]]:
+        nodes = self.device_nodes()
+        adjacency = self._adjacency(nodes, self.link_edges())
+        components = self._connected_components(nodes, adjacency) if nodes else []
+        return len(components), [len(c) for c in components]
+
+    def _confirm_export_warnings(self) -> bool:
+        warnings = self.validate_topology(for_export=True)
+        if not self.device_nodes():
+            QMessageBox.warning(self, "Nothing to export", "Add at least one device first.")
+            return False
+
+        component_count, sizes = self._component_summary()
+        if component_count > 1:
+            warnings.append(
+                f"Topology contains {component_count} disconnected physical groups "
+                f"(sizes: {', '.join(map(str, sizes))}). They will be laid out separately; no links will be invented."
+            )
+        if warnings:
+            response = QMessageBox.question(
+                self,
+                "Export validation",
+                "\n\n".join(warnings) + "\n\nContinue with export?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            return response == QMessageBox.StandardButton.Yes
+        return True
+
+    def preview_export_layout(self) -> None:
+        if not self._confirm_export_warnings():
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Clean Export Preview")
+        dialog.resize(1180, 760)
+        layout = QVBoxLayout(dialog)
+        info = QLabel(
+            "This preview uses the export layout, not your working canvas positions. "
+            "Preferred Root / Layout Priority guide the hierarchy; disconnected groups stay separate."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        scene = self._export_scene()
+        view = TopologyView(scene, dialog)
+        layout.addWidget(view, 1)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+        dialog.show()
+        view.fit_all()
+        dialog.exec()
+
+    def export_pdf(self) -> None:
+        if not self._confirm_export_warnings():
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export clean PDF", "topology.pdf", "PDF (*.pdf)"
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith(".pdf"):
+            filename += ".pdf"
+
+        scene = self._export_scene()
+        rect = scene.itemsBoundingRect().adjusted(-60, -60, 60, 60)
+        writer = QPdfWriter(filename)
+        writer.setResolution(300)
+        writer.setPageSize(QPageSize(QPageSize.PageSizeId.A3))
+        writer.setPageOrientation(QPageLayout.Orientation.Landscape)
+        writer.setTitle(self._export_title())
+        painter = QPainter(writer)
+        try:
+            target = QRectF(writer.pageLayout().paintRectPixels(writer.resolution()))
+            target = target.adjusted(40, 40, -40, -40)
+            scene.render(painter, target, rect, Qt.AspectRatioMode.KeepAspectRatio)
+        finally:
+            painter.end()
+        self.statusBar().showMessage(f"Exported clean PDF: {filename}", 7000)
+
+    def export_svg(self) -> None:
+        if not self._confirm_export_warnings():
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self, "Export clean SVG", "topology.svg", "SVG (*.svg)"
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith(".svg"):
+            filename += ".svg"
+
+        scene = self._export_scene()
+        rect = scene.itemsBoundingRect().adjusted(-60, -60, 60, 60)
+        aligned = rect.toAlignedRect()
+        generator = QSvgGenerator()
+        generator.setFileName(filename)
+        generator.setTitle(self._export_title())
+        generator.setDescription(f"Generated by {APP_NAME} v{APP_VERSION}")
+        generator.setSize(QSize(max(1, aligned.width()), max(1, aligned.height())))
+        generator.setViewBox(aligned)
+        painter = QPainter(generator)
+        try:
+            scene.render(painter, QRectF(aligned), rect, Qt.AspectRatioMode.KeepAspectRatio)
+        finally:
+            painter.end()
+        self.statusBar().showMessage(
+            f"Exported clean SVG: {filename} (vector format; useful for Visio import)", 7000
+        )
+
+    # ---------- Demo ----------
+    def load_demo(self) -> None:
+        payload = {
+            "version": APP_VERSION,
+            "devices": [
+                {
+                    "hostname": "CORE-01", "device_type": "Switch", "model": "C9500",
+                    "room_closet": "MDF", "topology_role": "Core", "preferred_root": True,
+                    "layout_priority": 1, "status": "Active", "x": 0, "y": -120,
+                },
+                {
+                    "hostname": "DIST-01", "device_type": "Switch", "model": "C9300",
+                    "room_closet": "IDF-A", "topology_role": "Distribution",
+                    "status": "Active", "x": -240, "y": 80,
+                },
+                {
+                    "hostname": "DIST-02", "device_type": "Switch", "model": "C9300",
+                    "room_closet": "IDF-B", "topology_role": "Distribution",
+                    "status": "Active", "x": 260, "y": 70,
+                },
+                {
+                    "hostname": "ACC-01", "device_type": "Switch", "model": "C9300",
+                    "room_closet": "IDF-A", "topology_role": "Access",
+                    "status": "Active", "x": -350, "y": 300,
+                },
+                {
+                    "hostname": "ACC-02", "device_type": "Switch", "model": "C9300",
+                    "room_closet": "IDF-A", "topology_role": "Access",
+                    "status": "Active", "x": -100, "y": 330,
+                },
+            ],
+            "links": [
+                {"hostname_a": "CORE-01", "interface_a": "Te1/0/1", "hostname_b": "DIST-01", "interface_b": "Te1/1/1", "speed": "10G", "media": "Fiber - SM", "mode": "Trunk"},
+                {"hostname_a": "CORE-01", "interface_a": "Te1/0/2", "hostname_b": "DIST-02", "interface_b": "Te1/1/1", "speed": "10G", "media": "Fiber - SM", "mode": "Trunk"},
+                {"hostname_a": "DIST-01", "interface_a": "Te1/0/1", "hostname_b": "ACC-01", "interface_b": "Te1/1/1", "speed": "10G", "media": "Fiber - MM", "mode": "Trunk"},
+                {"hostname_a": "DIST-01", "interface_a": "Te1/0/2", "hostname_b": "ACC-02", "interface_b": "Te1/1/1", "speed": "10G", "media": "Fiber - MM", "mode": "Trunk"},
+            ],
+        }
+        self.load_payload(payload)
+        self.current_file = None
+        self._mark_dirty()
+        self.view.fit_all()
+        self.statusBar().showMessage("Demo topology loaded. Canvas placement is intentionally freeform; PDF/SVG export will reflow it.", 7000)
+
+    # ---------- Window close ----------
+    def closeEvent(self, event) -> None:  # noqa: ANN001, N802
+        if self.dirty:
+            response = QMessageBox.question(
+                self,
+                "Unsaved topology",
+                "Close without saving your current topology?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if response != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        event.accept()
+
+
+def apply_app_style(app: QApplication) -> None:
+    app.setStyleSheet(
+        """
+        QMainWindow { background: #eef1f4; }
+        QDockWidget::title { padding: 7px; font-weight: 600; }
+        QToolBar { spacing: 6px; padding: 4px; }
+        QPushButton { padding: 6px 10px; }
+        QLineEdit, QComboBox, QSpinBox, QTextEdit {
+            background: white;
+            border: 1px solid #c8cdd4;
+            border-radius: 3px;
+            padding: 4px;
+        }
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus {
+            border: 1px solid #2f6fed;
+        }
+        """
+    )
+
+
+def main() -> int:
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setApplicationVersion(APP_VERSION)
+    apply_app_style(app)
+    window = MainWindow()
+    window.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
