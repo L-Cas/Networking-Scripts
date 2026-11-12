@@ -1,0 +1,391 @@
+#!/usr/bin/env python3
+"""File Encryptor v0.2.0 — desktop, password-based AES-256-GCM.
+
+Install: python -m pip install cryptography
+Run:     python FileEncryptor_v0_2_0.py
+Format v2: magic/version (8 bytes), random salt (16), nonce (12),
+           ciphertext, GCM tag (16). Header is authenticated. HMAC-SHA256
+           combines the password and external secret, then PBKDF2-HMAC-SHA256
+           (600,000 iterations) derives a 32-byte AES key. The external secret
+           is never stored in the encrypted file. Supports legacy v1 decryption.
+           Files are processed as binary; originals are retained.
+"""
+import hashlib
+import hmac
+import secrets
+import os
+from pathlib import Path
+import queue
+import shutil
+import struct
+import tempfile
+import threading
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+try:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:
+    raise SystemExit('Missing dependency. Run: python -m pip install cryptography')
+
+MAGIC_V1 = b'FENC\x01\x00\x00\x00'
+MAGIC = b'FENC\x02\x00\x00\x00'
+HEADER = struct.Struct('>8s16s12s')
+TAG_SIZE = 16
+ITERATIONS = 600_000
+CHUNK = 1024 * 1024
+# NIST GCM maximum plaintext per invocation: 2^39 - 256 bits.
+MAX_SIZE = (1 << 36) - 32
+EXT = '.fenc'
+
+
+def generate_secret():
+    """32 cryptographically random bytes, encoded for easy copying."""
+    return secrets.token_urlsafe(32)
+
+
+def key_from_password(password, salt, secret=None, version=2):
+    if not password:
+        raise ValueError('A password is required.')
+    material = password.encode('utf-8')
+    if version == 2:
+        if not secret:
+            raise ValueError('The original external secret is required for this file.')
+        material = hmac.digest(secret.encode('utf-8'),
+                               b'FileEncryptor-v2\x00' + material, 'sha256')
+    elif version != 1:
+        raise ValueError('Unsupported encryption version.')
+    return hashlib.pbkdf2_hmac('sha256', material, salt, ITERATIONS, dklen=32)
+
+
+def publish(temp, target):
+    """Publish only complete data; never replace an existing destination."""
+    if os.name == 'nt':
+        os.rename(temp, target)  # Windows rename fails if target exists.
+        return
+    try:
+        os.link(temp, target)
+    except FileExistsError:
+        raise
+    except OSError:
+        # Some removable filesystems do not support hard links.
+        # Exclusive creation still prevents accidental overwrites.
+        created = False
+        try:
+            with open(temp, 'rb') as src:
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                created = True
+                with os.fdopen(fd, 'wb') as dst:
+                    shutil.copyfileobj(src, dst, CHUNK)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+        except BaseException:
+            if created:
+                Path(target).unlink(missing_ok=True)
+            raise
+    finally:
+        # Caller also cleans up on errors.
+        Path(temp).unlink(missing_ok=True)
+
+
+def transform(source, target, password, decrypt=False, progress=lambda n: None, *, secret=None):
+    source, target = Path(source), Path(target)
+    if source.resolve() == target.resolve():
+        raise ValueError('Source and destination must be different files.')
+    if os.path.lexists(target):
+        raise FileExistsError('Destination already exists. Choose a new filename.')
+    if not decrypt and (not secret or len(secret) < 16):
+        raise ValueError('Choose an external secret of at least 16 characters or generate one.')
+    temp = None
+    try:
+        with source.open('rb') as src:
+            size = os.fstat(src.fileno()).st_size
+            if decrypt:
+                if size < HEADER.size + TAG_SIZE:
+                    raise ValueError('Not a valid encrypted file (too short).')
+                header = src.read(HEADER.size)
+                magic, salt, nonce = HEADER.unpack(header)
+                if magic not in (MAGIC, MAGIC_V1):
+                    raise ValueError('Unsupported file format. Select a v1 or v2 .fenc file.')
+                if magic == MAGIC_V1 and secret:
+                    raise ValueError('Legacy v1 files use only the password. Clear the external secret.')
+                version = 1 if magic == MAGIC_V1 else 2
+                total = size - HEADER.size - TAG_SIZE
+                if total > MAX_SIZE:
+                    raise ValueError('File exceeds the AES-GCM size limit.')
+                src.seek(-TAG_SIZE, os.SEEK_END)
+                tag = src.read(TAG_SIZE)
+                src.seek(HEADER.size)
+                ctx = Cipher(algorithms.AES(key_from_password(password, salt, secret, version)),
+                             modes.GCM(nonce, tag)).decryptor()
+            else:
+                total = size
+                if total > MAX_SIZE:
+                    raise ValueError('File exceeds the AES-GCM size limit.')
+                salt, nonce = os.urandom(16), os.urandom(12)
+                header = HEADER.pack(MAGIC, salt, nonce)
+                ctx = Cipher(algorithms.AES(key_from_password(password, salt, secret)),
+                             modes.GCM(nonce)).encryptor()
+            ctx.authenticate_additional_data(header)
+            # mkstemp creates a private temporary file on POSIX. Decrypted
+            # plaintext is not published at the destination before verification.
+            fd, temp = tempfile.mkstemp(prefix='.fenc-', suffix='.tmp', dir=target.parent)
+            with os.fdopen(fd, 'wb') as dst:
+                if not decrypt:
+                    dst.write(header)
+                remaining = total
+                while remaining:
+                    chunk = src.read(min(CHUNK, remaining))
+                    if not chunk:
+                        raise OSError('Source changed or was truncated during processing.')
+                    dst.write(ctx.update(chunk))
+                    remaining -= len(chunk)
+                    progress(int((total - remaining) * 100 / max(total, 1)))
+                if os.fstat(src.fileno()).st_size != size:
+                    raise OSError('Source size changed during processing.')
+                if not decrypt and src.read(1):
+                    raise OSError('Source grew during processing.')
+                dst.write(ctx.finalize())  # InvalidTag on bad password or modified data.
+                if not decrypt:
+                    dst.write(ctx.tag)
+                dst.flush()
+                os.fsync(dst.fileno())
+        publish(temp, target)
+        progress(100)
+    except InvalidTag:
+        raise ValueError('Incorrect password or external secret, or encrypted file has been damaged or modified.') from None
+    finally:
+        if temp is not None:
+            Path(temp).unlink(missing_ok=True)
+
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title('File Encryptor | v0.2.0')
+        self.geometry('820x600')
+        self.minsize(680, 560)
+        self.option_add('*tearOff', False)
+        self.mode = tk.StringVar(value='encrypt')
+        self.source = tk.StringVar()
+        self.target = tk.StringVar()
+        self.password = tk.StringVar()
+        self.confirm = tk.StringVar()
+        self.secret = tk.StringVar()
+        self.secret_confirm = tk.StringVar()
+        self.show = tk.BooleanVar()
+        self.status = tk.StringVar(value='Choose a file to begin.')
+        self.events = queue.Queue()
+        self.busy = False
+        self.controls = []
+        self.protocol('WM_DELETE_WINDOW', self.close)
+
+        frame = ttk.Frame(self, padding=24)
+        frame.pack(fill='both', expand=True)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text='File Encryptor', font=('TkDefaultFont', 19, 'bold')).grid(row=0, column=0, columnspan=3, sticky='w')
+        ttk.Label(frame, text='AES-256-GCM  /  PBKDF2-HMAC-SHA256  /  Offline').grid(row=1, column=0, columnspan=3, sticky='w', pady=(2, 16))
+        modes_frame = ttk.Frame(frame)
+        modes_frame.grid(row=2, column=0, columnspan=3, sticky='w', pady=(0, 10))
+        for label, mode in [('Encrypt', 'encrypt'), ('Decrypt', 'decrypt')]:
+            r = ttk.Radiobutton(modes_frame, text=label, variable=self.mode, value=mode, command=self.mode_changed)
+            r.pack(side='left', padx=(0, 20))
+            self.controls.append(r)
+        for row, label, var, browse in [(3, 'Input file', self.source, self.browse_source), (4, 'Output file', self.target, self.browse_target)]:
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky='w', pady=6, padx=(0, 12))
+            e = ttk.Entry(frame, textvariable=var)
+            e.grid(row=row, column=1, sticky='ew', pady=6)
+            b = ttk.Button(frame, text='Browse…', command=browse)
+            b.grid(row=row, column=2, padx=(8, 0))
+            self.controls.extend([e, b])
+        ttk.Label(frame, text='Password').grid(row=5, column=0, sticky='w', pady=6)
+        self.password_entry = ttk.Entry(frame, textvariable=self.password, show='*')
+        self.password_entry.grid(row=5, column=1, sticky='ew', pady=6)
+        check = ttk.Checkbutton(frame, text='Show', variable=self.show, command=self.toggle_password)
+        check.grid(row=5, column=2, sticky='w', padx=(8, 0))
+        self.controls.extend([self.password_entry, check])
+        self.confirm_label = ttk.Label(frame, text='Confirm password')
+        self.confirm_label.grid(row=6, column=0, sticky='w', pady=6)
+        self.confirm_entry = ttk.Entry(frame, textvariable=self.confirm, show='*')
+        self.confirm_entry.grid(row=6, column=1, sticky='ew', pady=6)
+        self.controls.append(self.confirm_entry)
+        ttk.Label(frame, text='External secret').grid(row=7, column=0, sticky='w', pady=6)
+        self.secret_entry = ttk.Entry(frame, textvariable=self.secret, show='*')
+        self.secret_entry.grid(row=7, column=1, sticky='ew', pady=6)
+        actions = ttk.Frame(frame)
+        actions.grid(row=7, column=2, sticky='w', padx=(8, 0))
+        self.generate_button = ttk.Button(actions, text='Generate', command=self.generate)
+        self.generate_button.pack(side='left')
+        copy_button = ttk.Button(actions, text='Copy', command=self.copy_secret)
+        copy_button.pack(side='left', padx=(4, 0))
+        self.secret_confirm_label = ttk.Label(frame, text='Confirm secret')
+        self.secret_confirm_label.grid(row=8, column=0, sticky='w', pady=6)
+        self.secret_confirm_entry = ttk.Entry(frame, textvariable=self.secret_confirm, show='*')
+        self.secret_confirm_entry.grid(row=8, column=1, sticky='ew', pady=6)
+        self.controls.extend([self.secret_entry, self.generate_button, copy_button, self.secret_confirm_entry])
+        self.help_text = tk.StringVar(value='Choose your own secret (16+ characters), or generate one. Save it separately; both secrets are required to decrypt.')
+        ttk.Label(frame, textvariable=self.help_text, wraplength=620).grid(row=9, column=0, columnspan=3, sticky='w', pady=(5, 0))
+        self.run_button = ttk.Button(frame, text='Encrypt file', command=self.start)
+        self.run_button.grid(row=10, column=0, columnspan=3, sticky='ew', pady=(14, 8))
+        self.controls.append(self.run_button)
+        self.progress = ttk.Progressbar(frame, maximum=100, mode='determinate')
+        self.progress.grid(row=11, column=0, columnspan=3, sticky='ew', pady=5)
+        ttk.Label(frame, textvariable=self.status, wraplength=620).grid(row=12, column=0, columnspan=3, sticky='w', pady=5)
+        ttk.Label(frame, text='Original files are kept. Existing files are never overwritten.').grid(row=13, column=0, columnspan=3, sticky='w', pady=(5, 0))
+        self.after(100, self.poll)
+
+    def suggested_target(self):
+        if not self.source.get():
+            return ''
+        p = Path(self.source.get())
+        if self.mode.get() == 'encrypt':
+            return str(p.with_name(p.name + EXT))
+        name = p.name[:-len(EXT)] if p.name.lower().endswith(EXT) else p.name + '.decrypted'
+        # Use a distinct name when the original already exists.
+        candidate = p.with_name(name or 'decrypted')
+        if os.path.lexists(candidate):
+            candidate = candidate.with_name(candidate.stem + '.decrypted' + candidate.suffix)
+        return str(candidate)
+
+    def mode_changed(self):
+        enc = self.mode.get() == 'encrypt'
+        self.run_button.config(text='Encrypt file' if enc else 'Decrypt file')
+        self.confirm.set('')
+        self.secret_confirm.set('')
+        if enc:
+            self.confirm_label.grid()
+            self.confirm_entry.grid()
+            self.secret_confirm_label.grid()
+            self.secret_confirm_entry.grid()
+            self.generate_button.state(['!disabled'])
+            self.help_text.set('Choose your own secret (16+ characters), or generate one. Save it separately; both secrets are required to decrypt.')
+        else:
+            self.confirm_label.grid_remove()
+            self.confirm_entry.grid_remove()
+            self.secret_confirm_label.grid_remove()
+            self.secret_confirm_entry.grid_remove()
+            self.generate_button.state(['disabled'])
+            self.help_text.set('Enter the exact original password and external secret. For legacy v1 files, leave the external secret blank.')
+        self.target.set(self.suggested_target())
+
+    def browse_source(self):
+        types = [('All files', '*')]
+        if self.mode.get() == 'decrypt':
+            types.insert(0, ('Encrypted files', '*.fenc'))
+        filename = filedialog.askopenfilename(filetypes=types)
+        if filename:
+            self.source.set(filename)
+            self.target.set(self.suggested_target())
+
+    def browse_target(self):
+        p = Path(self.target.get() or self.suggested_target() or 'output.fenc')
+        filename = filedialog.asksaveasfilename(initialdir=str(p.parent), initialfile=p.name,
+                                                confirmoverwrite=False)
+        if filename:
+            self.target.set(filename)
+
+    def toggle_password(self):
+        char = '' if self.show.get() else '*'
+        self.password_entry.config(show=char)
+        self.confirm_entry.config(show=char)
+        self.secret_entry.config(show=char)
+        self.secret_confirm_entry.config(show=char)
+
+    def generate(self):
+        value = generate_secret()
+        self.secret.set(value)
+        self.secret_confirm.set(value)
+        self.status.set('Secret generated. Copy and save it securely before encrypting.')
+
+    def copy_secret(self):
+        if not self.secret.get():
+            return
+        self.clipboard_clear()
+        self.clipboard_append(self.secret.get())
+        self.status.set('Secret copied to clipboard. Store securely and clear clipboard history afterward.')
+
+    def start(self):
+        if self.busy:
+            return
+        source, target = self.source.get(), self.target.get()
+        password = self.password.get()
+        secret = self.secret.get()
+        decrypt = self.mode.get() == 'decrypt'
+        if not source or not Path(source).is_file() or not target or not password:
+            messagebox.showerror('Missing information', 'Choose an input file, an output filename, and a password.')
+            return
+        if not decrypt and password != self.confirm.get():
+            messagebox.showerror('Password mismatch', 'The two passwords must match.')
+            return
+        if not decrypt and len(password) < 12:
+            messagebox.showerror('Password too short', 'Use at least 12 characters, preferably a long, unique passphrase.')
+            return
+        if not decrypt and len(secret) < 16:
+            messagebox.showerror('External secret required', 'Enter a secret of at least 16 characters, or use Generate.')
+            return
+        if not decrypt and secret != self.secret_confirm.get():
+            messagebox.showerror('Secret mismatch', 'The two external secrets must match exactly.')
+            return
+        if os.path.lexists(target):
+            messagebox.showerror('Destination exists', 'Choose a new output filename. Existing files are never overwritten.')
+            return
+        if not decrypt and not messagebox.askokcancel('Save your credentials',
+                'Decryption requires BOTH the password and external secret. Neither is saved in the file.\n\n'
+                'Have you saved both securely and separately from the encrypted file?'):
+            return
+        self.busy = True
+        for c in self.controls:
+            c.state(['disabled'])
+        self.progress['value'] = 0
+        self.status.set('Decrypting and verifying…' if decrypt else 'Encrypting…')
+        self.password.set('')
+        self.confirm.set('')
+        self.secret.set('')
+        self.secret_confirm.set('')
+        def work():
+            last = -1
+            def report(n):
+                nonlocal last
+                if n != last:
+                    self.events.put(('progress', n))
+                    last = n
+            try:
+                transform(source, target, password, decrypt, report, secret=secret)
+                self.events.put(('done', target))
+            except Exception as exc:
+                self.events.put(('error', str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def poll(self):
+        try:
+            while True:
+                kind, value = self.events.get_nowait()
+                if kind == 'progress':
+                    self.progress['value'] = value
+                else:
+                    self.busy = False
+                    for c in self.controls:
+                        c.state(['!disabled'])
+                    if self.mode.get() == 'decrypt':
+                        self.generate_button.state(['disabled'])
+                    if kind == 'done':
+                        self.status.set('Success: ' + value)
+                        messagebox.showinfo('Complete', 'File saved successfully:\n' + value)
+                    else:
+                        self.progress['value'] = 0
+                        self.status.set('Failed. Original file remains unchanged.')
+                        messagebox.showerror('Operation failed', value)
+        except queue.Empty:
+            pass
+        self.after(100, self.poll)
+
+    def close(self):
+        if self.busy:
+            messagebox.showinfo('Operation running', 'Please allow the current operation to finish before closing.')
+        else:
+            self.destroy()
+
+
+if __name__ == '__main__':
+    App().mainloop()
