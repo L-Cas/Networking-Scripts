@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Offline Cisco IOS XE stack planner. Python 3.10+; openpyxl optional for Excel.
+No SSH, no device writes. All exports require human review. Run with --self-test.
+"""
+import json, re, sys, difflib, hashlib
+from pathlib import Path
+from datetime import datetime
+from dataclasses import dataclass, field
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, simpledialog
+
+VERSION='0.1'
+PREFIXES='FastEthernet|GigabitEthernet|TwoGigabitEthernet|FiveGigabitEthernet|TenGigabitEthernet|TwentyFiveGigabitEthernet|TwentyFiveGigE|FortyGigabitEthernet|FortyGigE|HundredGigabitEthernet|HundredGigE|AppGigabitEthernet|Ethernet|Fa|Gi|Tw|Fi|Te|Twe|Fo|Hu|Ap|Eth|Et'
+IFACE=re.compile(r'(?<![\w./-])('+PREFIXES+r')(\d+)(/\d+/\d+(?:\.\d+)?)(?![\w./-])',re.I)
+HEADER=re.compile(r'^interface\s+(\S+)\s*$',re.I)
+PROVISION=re.compile(r'^switch\s+(\d+)\s+provision\s+(\S+)\s*$',re.I)
+MEMCMD=re.compile(r'^switch\s+(\d+)\s+(priority\s+\d+|stack port\s+\d+\s+\S.*)$',re.I)
+FULL_RUN=re.compile(r'^(?:show|sh) (?:running-config|running config|run)(?: all)?$',re.I)
+SWITCH=re.compile(r'^(?:show|sh) (?:switch|sw)$',re.I)
+ALLOWED_REF=re.compile(r'^\s*(?:monitor session\b|source interface\b|destination interface\b|(?:ip|ipv6) route\b|(?:ip |ipv6 |logging |snmp-server |ntp |tacacs |radius |ip ftp |ip tftp ).*\bsource-interface\b|(?:interface range)\b|(?:match|set) interface\b)',re.I)
+TEXT_LINE=re.compile(r'^\s*(?:description|remark|hostname|alias|banner)\b',re.I)
+
+def canonical(name):
+    return ' '.join(str(name).lower().split())
+
+def records(data):
+    cmds=data.get('commands',[])
+    if isinstance(cmds,dict):
+        cmds=[dict(v,command=v.get('command',k)) if isinstance(v,dict) else {'command':k,'output':v} for k,v in cmds.items()]
+    for c in cmds:
+        if not isinstance(c,dict): continue
+        name=next((c[k] for k in ('command','command_text','name','cli','requested_command','cmd') if isinstance(c.get(k),str)), '')
+        output=c.get('output','')
+        if isinstance(output,str) and str(c.get('status','success')).lower()=='success':
+            yield canonical(name),output
+
+def member_of(name):
+    m=IFACE.fullmatch(name)
+    return int(m[2]) if m else None
+
+def rename(text,mapping):
+    def sub(m):
+        n=int(m[2]); t=mapping.get(n,n)
+        return m[0] if t is None or t==n else m[1]+str(t)+m[3]
+    return IFACE.sub(sub,text)
+
+@dataclass
+class Source:
+    config:str
+    members:dict
+    blocks:list
+    name:str=''
+    warnings:list=field(default_factory=list)
+    digest:str=''
+
+@dataclass
+class Member:
+    key:str
+    old:int|None
+    target:int|None
+    model:str=''
+    state:str=''
+
+@dataclass
+class Result:
+    final:str=''
+    changes:list=field(default_factory=list)
+    warnings:list=field(default_factory=list)
+    errors:list=field(default_factory=list)
+    defaults:list=field(default_factory=list)
+    apply:list=field(default_factory=list)
+    provisioning:list=field(default_factory=list)
+    global_changes:list=field(default_factory=list)
+    procedure:list=field(default_factory=list)
+
+
+def split_blocks(config):
+    """Group top-level IOS commands and their indented children; keep banners opaque."""
+    blocks=[]; current=[]; delimiter=None
+    for line in config.splitlines():
+        if delimiter is not None:
+            current.append(line)
+            if delimiter in line: delimiter=None; blocks.append(current); current=[]
+            continue
+        if line and not line[0].isspace():
+            if current: blocks.append(current)
+            current=[line]
+            if line.lower().startswith('banner '):
+                parts=line.split(maxsplit=2)
+                if len(parts)==3 and parts[2]:
+                    payload=parts[2]; mark=payload[:2] if payload.startswith('^') and len(payload)>1 else payload[0]
+                    if mark not in payload[len(mark):]: delimiter=mark
+        else: current.append(line)
+    if current: blocks.append(current)
+    if delimiter is not None: raise ValueError('Unterminated banner; cannot safely parse configuration.')
+    return blocks
+
+
+def load_source(path):
+    p=Path(path); raw=p.read_bytes(); data=json.loads(raw.decode('utf-8-sig'))
+    if not isinstance(data,dict): raise ValueError('Expected one device collection JSON object.')
+    if data.get('document_type')=='collection_manifest': raise ValueError('Select an individual device collection, not the batch manifest.')
+    if data.get('schema_version') not in (None,'1.0',1.0): raise ValueError('Unsupported collector schema version.')
+    rec=list(records(data)); runs=[v for k,v in rec if FULL_RUN.fullmatch(k) and v.strip()]
+    if not runs: raise ValueError('No successful unfiltered show running-config command found. Available successful commands: '+', '.join(k for k,v in rec))
+    if len(set(runs))>1: raise ValueError('Multiple different full running-config outputs found; select a collection with one authoritative snapshot.')
+    lines=runs[0].splitlines(); warnings=[]
+    while lines and (not lines[0].strip() or re.match(r'^(Building configuration|Current configuration\s*:|Load for five secs:|Time source is)',lines[0],re.I)):
+        lines.pop(0)
+    if not lines or not any(x.strip()=='end' for x in lines[-5:]): raise ValueError('Running config does not end with end; possible truncated capture.')
+    config='\n'.join(lines)+'\n'; blocks=split_blocks(config); members={}; seen=set()
+    for b in blocks:
+        h=b[0]; pm=PROVISION.fullmatch(h); im=HEADER.fullmatch(h)
+        if pm: members.setdefault(int(pm[1]),{'model':'','state':'Provisioned'})['model']=pm[2]
+        if im:
+            n=member_of(im[1]); key=im[1].lower()
+            if n is not None:
+                if key in seen: raise ValueError('Duplicate source interface: '+im[1])
+                seen.add(key); members.setdefault(n,{'model':'','state':'Config only'})
+    sw=next((v for k,v in rec if SWITCH.fullmatch(k)), '')
+    if sw:
+        for l in sw.splitlines():
+            m=re.match(r'^\s*\*?\s*(\d+)\s+(Active|Standby|Member|Master)\b(.*)$',l,re.I)
+            if m:
+                n=int(m[1]); info=members.setdefault(n,{'model':'','state':''}); info['state']=m[2]+' / '+m[3].split()[-1] if m[3].split() else m[2]
+    else: warnings.append('show switch unavailable: membership inferred from provision statements and interface config only.')
+    if not members: raise ValueError('No stack members found in config or show switch.')
+    for n,i in members.items():
+        if not i['model']: warnings.append(f'Member {n}: model unknown; verify hardware and provisioning manually.')
+    name=next((l.split(maxsplit=1)[1] for l in lines if l.startswith('hostname ')),p.stem)
+    return Source(config,members,blocks,name,warnings,hashlib.sha256(raw).hexdigest())
+
+
+def initial_plan(src):
+    return [Member(str(n),n,n,i['model'],i['state']) for n,i in sorted(src.members.items())]
+
+
+def transform(src,plan,follow=True,limit=9):
+    r=Result(warnings=list(src.warnings)); orig={m.old:m for m in plan if m.old is not None}; active=[m for m in plan if m.target is not None]
+    targets=[m.target for m in active]; mapping={n:m.target for n,m in orig.items()}
+    if set(orig)!=set(src.members) or len(orig)!=sum(m.old is not None for m in plan): r.errors.append('Plan must include each original member exactly once.')
+    if not active: r.errors.append('At least one member must remain.')
+    if len(targets)!=len(set(targets)): r.errors.append('Two members share a target number.')
+    if any(not 1<=n<=limit for n in targets): r.errors.append(f'Targets must be between 1 and {limit}.')
+    if any(m.old is None and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*',m.model) for m in active): r.errors.append('Every new member needs a valid IOS provision model token.')
+    if r.errors:return r
+    dest={m.target:m for m in active}; impacted={n for n,t in mapping.items() if t!=n}|{t for n,t in mapping.items() if t is not None and t!=n}|{m.target for m in active if m.old is None}
+    configmap=mapping if follow else {n:(n if n in dest else None) for n in src.members}
+    before={}; after={}; after_blocks=[]; provisions=set(); seen=set(); global_seen=set()
+    def remap_refs(line):
+        if TEXT_LINE.match(line): return line
+        refs=list(IFACE.finditer(line)); changed=[m for m in refs if configmap.get(int(m[2]),int(m[2]))!=int(m[2])]
+        if not changed:return line
+        if any(configmap.get(int(m[2])) is None for m in changed):
+            r.warnings.append('Unresolved reference to removed member: '+line.strip());return line
+        if not ALLOWED_REF.match(line):
+            r.warnings.append('Unchanged reference in unrecognized CLI context: '+line.strip());return line
+        new=rename(line,configmap)
+        if new!=line:r.global_changes.append((line,new))
+        return new
+    for block in src.blocks:
+        h=block[0]; im=HEADER.fullmatch(h); pm=PROVISION.fullmatch(h); mc=MEMCMD.fullmatch(h)
+        if im and member_of(im[1]) is not None:
+            name=im[1]; n=member_of(name); t=configmap.get(n,n); before[name]=block
+            if t is None:
+                r.changes.append((name,'','Removed','\n'.join(block),''));continue
+            newname=rename(name,configmap); new=['interface '+newname]+[remap_refs(l) for l in block[1:]]
+            if newname.lower() in seen:r.errors.append('Duplicate generated interface: '+newname)
+            seen.add(newname.lower());after[newname]=new;after_blocks.append(new)
+            if new!=block or n in impacted:
+                r.changes.append((name,newname,'Move' if name!=newname else 'Retain', '\n'.join(block),'\n'.join(new)))
+        elif pm:
+            n=int(pm[1]); t=mapping.get(n,n)
+            if t is not None:
+                new=f'switch {t} provision {pm[2]}'; provisions.add(t);after_blocks.append([new]+block[1:])
+            else:new=''
+            if new!=h:r.global_changes.append((h,new))
+        elif mc:
+            n=int(mc[1]);t=mapping.get(n,n) if follow else (n if n in dest else None)
+            new=f'switch {t} {mc[2]}' if t is not None else ''
+            if new:after_blocks.append([new]+block[1:])
+            if new!=h:r.global_changes.append((h,new))
+        elif h.lower().startswith('banner '):after_blocks.append(block)
+        else:
+            if re.match(r'^switch\s+\d+\b',h,re.I) and int(h.split()[1]) in impacted:r.warnings.append('Review unhandled member-specific command: '+h)
+            # Unknown physical interface forms and range headings need explicit review.
+            if im and member_of(im[1]) is None and re.search(r'\d+/\d+/\d+',im[1]):r.warnings.append('Unrecognized interface type (not moved): '+im[1])
+            after_blocks.append([remap_refs(l) for l in block])
+    extra=[]
+    for m in active:
+        if m.target not in provisions and m.model:
+            new=f'switch {m.target} provision {m.model}'; extra.append(new);r.global_changes.append(('',new));provisions.add(m.target)
+    # Insert new provision lines before first interface; do not append after end.
+    index=next((i for i,b in enumerate(after_blocks) if HEADER.fullmatch(b[0]) or b[0]=='end'),len(after_blocks))
+    if extra:after_blocks[index:index]=[[x] for x in extra]
+    r.final='\n'.join(l for b in after_blocks for l in b)+'\n'
+    # Defaults only for known target interface names. Never default missing/removed hardware.
+    r.defaults=sorted((f'default interface {name}' for name in after if member_of(name) in impacted),key=natural)
+    # Restore ALL captured destination stanzas in impacted namespaces (not just deltas).
+    for name in sorted(after,key=natural):
+        if member_of(name) in impacted:r.apply.extend(after[name]+['!'])
+    # Explicitly note stale config that cannot be proven valid on the resulting hardware.
+    for name in before:
+        n=member_of(name)
+        if n in dest and n in impacted and name.lower() not in {x.lower() for x in after}:
+            r.warnings.append('Old slot interface absent from target; review stale configuration manually: '+name)
+    r.provisioning=[f'switch {m.target} provision {m.model}' for m in sorted(active,key=lambda x:x.target) if m.model and (m.target in impacted)]
+    for m in plan:
+        if m.old is not None and m.target is None and m.old not in dest:r.provisioning.append(f'! AFTER physical removal, verify platform: no switch {m.old} provision')
+    for m in active:
+        if m.old is None:r.warnings.append(f'New member {m.target}: no interface inventory available; no port layout or default stanzas invented.')
+        elif m.target!=m.old:r.warnings.append(f'Confirm member {m.old} hardware and module compatibility at target {m.target}.')
+    if not follow and impacted:r.warnings.append('Slot-based configuration selected: check that target hardware supports the existing slot interfaces.')
+    r.procedure=['REVIEW ONLY — logical mapping, NOT a pasteable CLI sequence.', '1. Back up current running/startup config; verify model, serials, stack state, console access and outage approval.', '2. Plan physical removal/addition and renumbering using platform-specific Cisco procedure. Occupied targets require staging; never run logical swaps directly.']
+    r.procedure += [f'   {m.old if m.old is not None else "NEW"} -> {m.target if m.target is not None else "REMOVE"} ({m.model or "unknown model"})' for m in plan]
+    r.procedure += ['3. After hardware changes/reloads, verify actual member numbers and target interface inventory. Reconcile provisioning manually.', '4. Review changed global references, uplinks, port channels, SPAN, routing and all warnings.', '5. If appropriate, default affected target interfaces BEFORE applying their replacement stanzas. This can disconnect traffic; use console access and maintenance window.', '6. Restore reviewed interface config, then reconcile global changes; validate before saving. Never blindly paste the full target config.']
+    r.warnings=list(dict.fromkeys(r.warnings));return r
+
+
+def natural(s):return [int(p) if p.isdigit() else p.lower() for p in re.split(r'(\d+)',s)]
+
+def export(src,plan,r,folder,cfg=True,xlsx=True,follow=True,defaults=True):
+    if r.errors:raise ValueError('\n'.join(r.errors))
+    if not cfg and not xlsx:raise ValueError('Choose at least one output format.')
+    if xlsx:
+        try: from openpyxl import Workbook
+        except ImportError: raise RuntimeError('Excel export requires openpyxl. Run: py -m pip install openpyxl')
+    folder=Path(folder);folder.mkdir(parents=True,exist_ok=False)
+    planrows=[(m.old,m.target,m.model,m.state,'Add' if m.old is None else 'Remove' if m.target is None else 'Keep' if m.old==m.target else 'Move') for m in plan]
+    files={'01_Precheck.txt':'show switch\nshow switch detail\nshow switch stack-ports summary\nshow inventory\nshow interfaces status\nshow etherchannel summary\nshow running-config\n', '02_Renumber_Review.txt':'\n'.join(r.procedure)+'\n', '04_Interface_Config.cfg':'! REVIEW ONLY - verify actual target ports before use\n'+'\n'.join(r.apply)+'\n', '05_Provisioning_Review.txt':'REVIEW ONLY — not a pasteable sequence\n'+'\n'.join(r.provisioning)+'\n', '06_Final_Target_Config.cfg':r.final, '07_Global_Changes.txt':'\n\n'.join('BEFORE: '+a+'\nAFTER: '+b for a,b in r.global_changes)+'\n', '08_Warnings.txt':'\n'.join(r.warnings)+'\n', '09_Original_Config.cfg':src.config}
+    if defaults:files['03_Interface_Defaults.cfg']='! DESTRUCTIVE - REVIEW ONLY; after physical mapping verified, before restore\n'+'\n'.join(r.defaults)+'\n'
+    (folder/'Renumber_Plan.json').write_text(json.dumps({'version':VERSION,'source_sha256':src.digest,'hostname':src.name,'follow_physical':follow,'members':[vars(m) for m in plan],'warnings':r.warnings},indent=2),encoding='utf-8')
+    if cfg:
+        out=folder/'CFG';out.mkdir()
+        for name,content in files.items():(out/name).write_text(content,encoding='utf-8')
+    if xlsx:
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+        wb=Workbook();wb.remove(wb.active)
+        def sheet(name,headers,rows,widths):
+            ws=wb.create_sheet(name);ws.append(headers)
+            for row in rows:
+                ws.append(list(row))
+                for c in ws[ws.max_row]:
+                    if isinstance(c.value,str):c.data_type='s'
+                    c.alignment=Alignment(vertical='top',wrap_text=True)
+            for c in ws[1]:c.fill=PatternFill('solid',fgColor='203B55');c.font=Font(bold=True,color='FFFFFF')
+            for i,w in enumerate(widths,1):ws.column_dimensions[get_column_letter(i)].width=w
+            ws.freeze_panes='A2';ws.auto_filter.ref=ws.dimensions
+            return ws
+        sheet('Stack Plan',['Current','Target','Model','Observed state','Action'],planrows,[14,14,25,25,16])
+        sheet('Interface Changes',['Before','After','Action'],[x[:3] for x in r.changes],[32,32,16])
+        ws=sheet('Config Preview',['Before interface','After interface','Action','Before config','After config'],r.changes,[30,30,15,72,72])
+        for i,row in enumerate(r.changes,2):ws.row_dimensions[i].height=min(300,max(30,15*max(row[3].count('\n')+1,row[4].count('\n')+1)))
+        sheet('Added Members',['Current','Target','Model','State','Action'],[x for x in planrows if x[0] is None],[14,14,26,26,15])
+        sheet('Removed Members',['Current','Target','Model','State','Action'],[x for x in planrows if x[1] is None],[14,14,26,26,15])
+        sheet('Warnings',['Review required'],[(w,) for w in r.warnings],[115])
+        sheet('Global Changes',['Before','After'],r.global_changes,[85,85])
+        sheet('Procedure',['Manual review and execution order'],[(l,) for l in r.procedure],[115])
+        sheet('Commands',['Section','CLI / review text'],[(name,line) for name,content in files.items() if name not in ('06_Final_Target_Config.cfg','09_Original_Config.cfg') for line in content.splitlines()],[36,115])
+        sheet('Full Target Config',['Line','Config'],enumerate(r.final.splitlines(),1),[12,115])
+        wb.save(folder/'Stack_Renumber_Plan.xlsx')
+    return folder
+
+class App:
+    def __init__(self,root):
+        self.root=root;self.src=None;self.plan=[];self.drag=None;self.drag_xy=None;self.result=None;self.selected=None
+        root.title('Stack Renumber | Universal Collector | v'+VERSION);root.geometry('1180x790');root.minsize(880,650)
+        style=ttk.Style(root);style.configure('Title.TLabel',font=('Segoe UI',20,'bold'));style.configure('Sub.TLabel',font=('Segoe UI',10));style.configure('Treeview',rowheight=27);style.configure('Accent.TButton',font=('Segoe UI',10,'bold'))
+        outer=ttk.Frame(root,padding=16);outer.pack(fill='both',expand=True)
+        ttk.Label(outer,text='Stack Renumber',style='Title.TLabel').pack(anchor='w');ttk.Label(outer,text='Offline planning  /  Map members  /  Review changes  /  Export',style='Sub.TLabel').pack(anchor='w',pady=(0,12))
+        bar=ttk.Frame(outer);bar.pack(fill='x');ttk.Button(bar,text='Open collection JSON',command=self.load,style='Accent.TButton').pack(side='left');self.filename=tk.StringVar(value='No collection loaded');ttk.Label(bar,textvariable=self.filename).pack(side='left',padx=12);ttk.Button(bar,text='Reset plan',command=self.reset).pack(side='right');ttk.Button(bar,text='Open saved plan',command=self.open_plan).pack(side='right',padx=5)
+        pan=ttk.Panedwindow(outer,orient='vertical');pan.pack(fill='both',expand=True,pady=10)
+        upper=ttk.Frame(pan,padding=5);pan.add(upper,weight=3)
+        views=ttk.Frame(upper);views.pack(fill='both',expand=True)
+        left=ttk.LabelFrame(views,text='Current stack — captured',padding=8);right=ttk.LabelFrame(views,text='Planned stack — drag rows to swap',padding=8);left.pack(side='left',fill='both',expand=True);right.pack(side='left',fill='both',expand=True,padx=(12,0))
+        self.current=self.tree(left,('number','model','state'),('Member','Model','Observed state'),(80,150,160));self.current.configure(selectmode='browse')
+        self.target=self.tree(right,('number','source','model','action'),('Target','Source','Model','Action'),(65,65,150,90));self.target.configure(selectmode='extended')
+        for tree in (self.current,self.target):
+            tree.tag_configure('Move',background='#e1efff');tree.tag_configure('Add',background='#e1f5e7');tree.tag_configure('Remove',background='#fbe5e5');tree.tag_configure('Collision',background='#ffd5d5')
+        self.target.bind('<ButtonPress-1>',self.drag_start,add='+');self.target.bind('<ButtonRelease-1>',self.drag_end,add='+');self.target.bind('<Double-1>',lambda e:self.move())
+        tools=ttk.Frame(upper);tools.pack(fill='x',pady=(8,0))
+        for txt,fn in [('Swap selected',self.swap),('Move / edit number',self.move),('Add switch',self.add),('Remove / restore',self.remove),('Compact numbers',self.compact)]:ttk.Button(tools,text=txt,command=fn).pack(side='left',padx=(0,5))
+        self.follow=tk.BooleanVar(value=True);ttk.Checkbutton(tools,text='Config follows physical switch',variable=self.follow,command=self.refresh).pack(side='right')
+        lower=ttk.Frame(pan,padding=5);pan.add(lower,weight=4)
+        self.tabs=ttk.Notebook(lower);self.tabs.pack(fill='both',expand=True)
+        p=ttk.Frame(self.tabs,padding=4);self.tabs.add(p,text='Interface changes');self.changes=self.tree(p,('old','new','action'),('Before interface','After interface','Action'),(255,255,85));self.changes.bind('<<TreeviewSelect>>',self.show_change)
+        q=ttk.Frame(self.tabs,padding=4);self.tabs.add(q,text='Before / after config');self.oldtxt,self.newtxt=self.two_text(q,'Before','After')
+        self.diff=self.text_tab('Full config diff');self.review=self.text_tab('Warnings / procedure');self.cli=self.text_tab('Generated CLI');self.final=self.text_tab('Target config')
+        bottom=ttk.Frame(outer);bottom.pack(fill='x');self.status=tk.StringVar(value='Load a device collection to start.');self.status_label=ttk.Label(bottom,textvariable=self.status);self.status_label.pack(anchor='w',pady=(0,6))
+        opts=ttk.Frame(bottom);opts.pack(fill='x');self.cfg=tk.BooleanVar(value=True);self.xlsx=tk.BooleanVar(value=True);self.defaults=tk.BooleanVar(value=True)
+        ttk.Label(opts,text='Export:').pack(side='left');ttk.Checkbutton(opts,text='CFG / review files',variable=self.cfg).pack(side='left',padx=7);ttk.Checkbutton(opts,text='Excel workbook',variable=self.xlsx).pack(side='left',padx=7);ttk.Checkbutton(opts,text='Include optional interface defaults',variable=self.defaults,command=self.refresh).pack(side='left',padx=7)
+        self.generate_btn=ttk.Button(opts,text='Generate exports…',command=self.generate,style='Accent.TButton',state='disabled');self.generate_btn.pack(side='right')
+        self.refresh()
+    def tree(self,parent,cols,heads,widths):
+        wrap=ttk.Frame(parent);wrap.pack(fill='both',expand=True);t=ttk.Treeview(wrap,columns=cols,show='headings',height=7);v=ttk.Scrollbar(wrap,orient='vertical',command=t.yview);t.configure(yscrollcommand=v.set);v.pack(side='right',fill='y');t.pack(fill='both',expand=True)
+        for c,h,w in zip(cols,heads,widths):t.heading(c,text=h);t.column(c,width=w,minwidth=45,stretch=True)
+        return t
+    def text_box(self,parent):
+        frame=ttk.Frame(parent);frame.pack(fill='both',expand=True);t=tk.Text(frame,wrap='none',font=('Consolas',10),height=8,undo=False);ys=ttk.Scrollbar(frame,command=t.yview);xs=ttk.Scrollbar(frame,orient='horizontal',command=t.xview);t.configure(yscrollcommand=ys.set,xscrollcommand=xs.set);ys.pack(side='right',fill='y');xs.pack(side='bottom',fill='x');t.pack(fill='both',expand=True);t.configure(state='disabled');return t
+    def text_tab(self,title):
+        f=ttk.Frame(self.tabs,padding=4);self.tabs.add(f,text=title);return self.text_box(f)
+    def two_text(self,parent,a,b):
+        left=ttk.LabelFrame(parent,text=a);right=ttk.LabelFrame(parent,text=b);left.pack(side='left',fill='both',expand=True);right.pack(side='left',fill='both',expand=True,padx=(6,0));return self.text_box(left),self.text_box(right)
+    def set_text(self,t,s):
+        t.configure(state='normal');t.delete('1.0','end');t.insert('1.0',s);t.configure(state='disabled')
+    def load(self):
+        p=filedialog.askopenfilename(title='Open a device collection',filetypes=[('JSON collection','*.json'),('All files','*.*')]);
+        if not p:return
+        try:src=load_source(p)
+        except Exception as e:messagebox.showerror('Import failed',str(e));return
+        self.src=src;self.plan=initial_plan(src);self.filename.set(Path(p).name+'  |  '+src.name);self.refresh()
+    def open_plan(self):
+        if not self.src:messagebox.showinfo('Open plan','Load the original collection first.');return
+        p=filedialog.askopenfilename(filetypes=[('Saved plan','*.json')]);
+        if not p:return
+        try:
+            d=json.loads(Path(p).read_text(encoding='utf-8'));assert d['source_sha256']==self.src.digest,'Plan belongs to a different collection.'
+            plan=[Member(**m) for m in d['members']];assert len({m.key for m in plan})==len(plan),'Duplicate plan keys.'
+            result=transform(self.src,plan,bool(d['follow_physical']));assert not result.errors,'\n'.join(result.errors)
+            self.plan=plan;self.follow.set(bool(d['follow_physical']));self.refresh()
+        except Exception as e:messagebox.showerror('Cannot open plan',str(e))
+    def reset(self):
+        if self.src and messagebox.askyesno('Reset plan','Restore the original member mapping?'):self.plan=initial_plan(self.src);self.refresh()
+    def get_selected(self):
+        return [m for m in self.plan if m.key in self.target.selection()]
+    def drag_start(self,e):self.drag=self.target.identify_row(e.y);self.drag_xy=(e.x,e.y)
+    def drag_end(self,e):
+        end=self.target.identify_row(e.y)
+        if self.drag and end and end!=self.drag and self.drag_xy and abs(e.y-self.drag_xy[1])>10:
+            a=next(m for m in self.plan if m.key==self.drag);b=next(m for m in self.plan if m.key==end)
+            if a.target is not None and b.target is not None:a.target,b.target=b.target,a.target;self.refresh()
+        self.drag=None
+    def swap(self):
+        rows=self.get_selected()
+        if len(rows)!=2 or any(m.target is None for m in rows):messagebox.showinfo('Swap','Select two active target rows (Ctrl-click).');return
+        rows[0].target,rows[1].target=rows[1].target,rows[0].target;self.refresh()
+    def move(self):
+        rows=self.get_selected()
+        if len(rows)!=1:messagebox.showinfo('Move','Select one planned member.');return
+        m=rows[0];n=simpledialog.askinteger('Target member','New member number (1–9):',initialvalue=m.target or m.old or 1,minvalue=1,maxvalue=9,parent=self.root)
+        if n is None:return
+        other=next((x for x in self.plan if x is not m and x.target==n),None)
+        if other and not messagebox.askyesno('Occupied target',f'Target {n} is occupied. Create a temporary collision for editing? Export is blocked until resolved.'):return
+        m.target=n;self.refresh()
+    def add(self):
+        if not self.src:return
+        free=next((i for i in range(1,10) if i not in {m.target for m in self.plan}),None)
+        if free is None:messagebox.showinfo('Add switch','No free target numbers (1–9).');return
+        n=simpledialog.askinteger('Add switch','Target member number (1–9):',initialvalue=free,minvalue=1,maxvalue=9,parent=self.root)
+        if n is None:return
+        model=simpledialog.askstring('Add switch','Exact IOS provision model token (e.g. c9300-48p):',initialvalue=next((m.model for m in self.plan if m.model),''),parent=self.root)
+        if not model:return
+        key='new-'+str(datetime.now().timestamp());self.plan.append(Member(key,None,n,model.strip(),'New hardware'));self.refresh()
+    def remove(self):
+        rows=self.get_selected()
+        if not rows:return
+        if not messagebox.askyesno('Change membership','Remove selected active rows or restore selected removed rows? Removed configs will not be copied in follow-physical mode.'):return
+        for m in rows:
+            if m.old is None:self.plan.remove(m)
+            elif m.target is None:m.target=m.old
+            else:m.target=None
+        self.refresh()
+    def compact(self):
+        if not self.src:return
+        for i,m in enumerate(sorted((x for x in self.plan if x.target is not None),key=lambda x:x.target),1):m.target=i
+        self.refresh()
+    def show_change(self,e=None):
+        if self.result and self.changes.selection():
+            i=int(self.changes.selection()[0]);row=self.result.changes[i];self.set_text(self.oldtxt,row[3]);self.set_text(self.newtxt,row[4])
+    def refresh(self):
+        selections=self.target.selection()
+        for tree in (self.current,self.target,self.changes):tree.delete(*tree.get_children())
+        if not self.src:return
+        for n,info in sorted(self.src.members.items()):self.current.insert('','end',values=(n,info['model'] or 'Unknown',info['state']))
+        for m in sorted(self.plan,key=lambda x:(x.target is None,x.target or 0,x.old or 0)):
+            action='Remove' if m.target is None else 'Add' if m.old is None else 'Keep' if m.old==m.target else 'Move'
+            tag='Collision' if m.target is not None and sum(x.target==m.target for x in self.plan)>1 else action
+            self.target.insert('','end',iid=m.key,values=(m.target if m.target is not None else '—',m.old if m.old is not None else 'NEW',m.model or 'Unknown',action),tags=(tag,))
+        self.target.selection_set([x for x in selections if self.target.exists(x)])
+        r=self.result=transform(self.src,self.plan,self.follow.get())
+        for i,row in enumerate(r.changes):self.changes.insert('','end',iid=str(i),values=row[:3],tags=(row[2],))
+        self.set_text(self.oldtxt,'');self.set_text(self.newtxt,'')
+        self.set_text(self.diff,'\n'.join(difflib.unified_diff(self.src.config.splitlines(),r.final.splitlines(),fromfile='Captured config',tofile='Planned config',lineterm='')) if not r.errors else '')
+        self.set_text(self.review,'\n'.join(['ERROR: '+x for x in r.errors]+['WARNING: '+x for x in r.warnings]+['','']+r.procedure))
+        self.set_text(self.cli,'\n'.join(['REVIEW ONLY — not a single pasteable script.','', 'PROVISIONING (manual reconciliation)']+r.provisioning+(['','OPTIONAL DEFAULTS (destructive; before restore)']+r.defaults if self.defaults.get() else [])+['','INTERFACE RESTORE']+r.apply+['','GLOBAL CHANGES (manual reconciliation)']+[f'BEFORE: {a}\nAFTER: {b}' for a,b in r.global_changes]))
+        self.set_text(self.final,r.final)
+        if r.errors:self.status.set('BLOCKED  |  '+'; '.join(r.errors));self.generate_btn.configure(state='disabled')
+        else:self.status.set(f'{len(self.src.members)} captured members  →  {sum(m.target is not None for m in self.plan)} planned  |  {len(r.changes)} affected interface blocks  |  {len(r.warnings)} review warnings');self.generate_btn.configure(state='normal')
+    def generate(self):
+        if not self.result or self.result.errors:return
+        if not self.cfg.get() and not self.xlsx.get():messagebox.showinfo('Export','Choose CFG, Excel, or both.');return
+        if not messagebox.askyesno('Review required','Exports are offline planning artifacts, not verified execution scripts. Review all warnings and verify target hardware before applying. Continue?'):return
+        d=filedialog.askdirectory(title='Choose export parent folder');
+        if not d:return
+        folder=Path(d)/('Stack_Renumber_'+datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        try:export(self.src,self.plan,self.result,folder,self.cfg.get(),self.xlsx.get(),self.follow.get(),self.defaults.get());messagebox.showinfo('Export complete',str(folder))
+        except Exception as e:messagebox.showerror('Export failed',str(e))
+
+
+def self_test():
+    import tempfile
+    config=['Building configuration...','Current configuration : 5000 bytes','!','hostname LAB','!']
+    for n in range(1,6):config += [f'switch {n} provision c9300-48p']
+    for n in range(1,6):
+        for p in ['GigabitEthernet','TenGigabitEthernet','FiveGigabitEthernet','FastEthernet']:
+            config += [f'interface {p}{n}/0/1',f' description MEMBER-{n} Gi4/0/1',f' switchport access vlan {100+n}','!']
+    config+=['interface Vlan120',' ip address 192.0.2.1 255.255.255.0','!','monitor session 1 source interface Gi4/0/1','monitor session 1 destination interface Gi5/0/1','end']
+    d={'schema_version':'1.0','document_type':'device_collection','commands':[{'command':'show running-config','status':'success','output':'\n'.join(config)},{'command':'show switch','status':'success','output':'\n'.join(f'{n} Member 0000.0000.0000 1 V01 Ready' for n in range(1,6))}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        p=Path(tmp)/'test.json';p.write_text(json.dumps(d));s=load_source(p);assert len(s.members)==5
+        a=initial_plan(s);a[3].target,a[4].target=5,4;r=transform(s,a)
+        assert not r.errors and len(r.changes)==8 and len(r.defaults)==8
+        assert 'interface GigabitEthernet5/0/1\n description MEMBER-4 Gi4/0/1' in r.final
+        assert 'interface GigabitEthernet4/0/1\n description MEMBER-5 Gi4/0/1' in r.final
+        assert 'monitor session 1 source interface Gi5/0/1' in r.final
+        assert 'interface Vlan120' in r.final
+        export(s,a,r,Path(tmp)/'both',True,True);assert (Path(tmp)/'both/Stack_Renumber_Plan.xlsx').exists()
+        export(s,a,r,Path(tmp)/'cfg',True,False);assert not (Path(tmp)/'cfg/Stack_Renumber_Plan.xlsx').exists()
+        export(s,a,r,Path(tmp)/'excel',False,True);assert not (Path(tmp)/'excel/CFG').exists()
+        b=initial_plan(s);b.append(Member('new',None,6,'c9300-48p'));rr=transform(s,b);assert not rr.errors and 'switch 6 provision c9300-48p' in rr.final
+        b=initial_plan(s);b[1].target=None
+        for i,m in enumerate((m for m in b if m.target is not None),1):m.target=i
+        rr=transform(s,b);assert not rr.errors and 'switch 5 provision' not in rr.final and 'interface GigabitEthernet2/0/1\n description MEMBER-3' in rr.final
+        b=initial_plan(s);b[0].target=2;assert transform(s,b).errors
+        rr=transform(s,a,False);assert 'interface GigabitEthernet4/0/1\n description MEMBER-4' in rr.final
+        print('PASS: import, simultaneous swap, add, remove/compact, collision detection, slot-based mapping, global reference mapping, CFG/Excel/both export.')
+
+if __name__=='__main__':
+    if '--self-test' in sys.argv:self_test()
+    else:
+        root=tk.Tk();App(root);root.mainloop()
